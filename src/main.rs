@@ -8,7 +8,6 @@ use std::path::PathBuf;
 enum View { Chooser, Editor, Library, Settings }
 
 struct App {
-    hotkey_manager: Option<GlobalHotKeyManager>,
     hotkey_id: Option<u32>,
     overlay_visible: bool,
     config: Config,
@@ -22,7 +21,6 @@ struct App {
     notes: Vec<PathBuf>,
     search_query: String,
     preview_lines: usize,
-    selected: Option<usize>,
     error: Option<String>,
 }
 
@@ -33,17 +31,17 @@ impl App {
         let _ = config.validate();
         let storage = Storage::new(&config);
         let preview_lines = config.preview_lines;
-        let (hotkey_manager, hotkey_id) = match GlobalHotKeyManager::new() {
+        let hotkey_id = match GlobalHotKeyManager::new() {
             Ok(mgr) => {
                 let hotkey = HotKey::new(Some(Modifiers::ALT), Code::Space);
                 let id = hotkey.id();
                 let _ = mgr.register(hotkey);
-                (Some(mgr), Some(id))
+                let _ = Box::leak(Box::new(mgr)); // keep manager alive
+                Some(id)
             }
-            Err(_) => (None, None),
+            Err(_) => None,
         };
         Self {
-            hotkey_manager,
             hotkey_id,
             overlay_visible: false,
             config,
@@ -57,7 +55,6 @@ impl App {
             notes: vec![],
             search_query: String::new(),
             preview_lines,
-            selected: None,
             error: None,
         }
     }
@@ -97,7 +94,7 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         if let (Some(id), Ok(event)) = (self.hotkey_id, GlobalHotKeyEvent::receiver().try_recv()) {
             if event.id == id { ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true)); self.overlay_visible = true; }
         }
