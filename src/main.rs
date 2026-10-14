@@ -33,7 +33,7 @@ impl App {
         let preview_lines = config.preview_lines;
         let hotkey_id = match GlobalHotKeyManager::new() {
             Ok(mgr) => {
-                let hotkey = HotKey::new(Some(Modifiers::ALT), Code::Space);
+                let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Space);
                 let id = hotkey.id();
                 let _ = mgr.register(hotkey);
                 let _ = Box::leak(Box::new(mgr)); // keep manager alive
