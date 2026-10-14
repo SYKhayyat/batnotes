@@ -16,6 +16,7 @@ struct App {
     storage: Storage,
     view: View,
     editor_text: String,
+    original_editor: String,
     editor_path: Option<PathBuf>,
     editor_direction: Direction,
     notes: Vec<PathBuf>,
@@ -50,6 +51,7 @@ impl App {
             storage,
             view: View::Chooser,
             editor_text: String::new(),
+            original_editor: String::new(),
             editor_path: None,
             editor_direction: Direction::Rtl,
             notes: vec![],
@@ -86,6 +88,7 @@ impl App {
             Ok(path) => {
                 self.editor_path = Some(path);
                 self.editor_text.clear();
+                self.original_editor.clear();
                 self.view = View::Chooser;
             }
             Err(e) => self.error = Some(e.to_string()),
@@ -102,6 +105,20 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.view = View::Chooser;
             self.editor_text.clear();
+            self.original_editor.clear();
+        }
+        let focused = ctx.input(|i| i.focused);
+        if !focused {
+            let dirty = self.view == View::Editor && self.editor_text != self.original_editor;
+            if dirty {
+                if self.error.is_none() { self.error = Some("Unsaved changes".to_string()); }
+            } else {
+                self.error = None;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                self.view = View::Chooser;
+                self.editor_text.clear();
+                self.original_editor.clear();
+            }
         }
         egui::TopBottomPanel::top("title").show(ctx, |ui| {
             ui.horizontal(|ui| {
@@ -120,6 +137,7 @@ impl eframe::App for App {
                             if ui.button("A — New note (Alt-A)").clicked() {
                                 self.editor_path = None;
                                 self.editor_text.clear();
+                                self.original_editor.clear();
                                 self.editor_direction = self.config.default_direction;
                                 self.view = View::Editor;
                             }
@@ -150,6 +168,7 @@ impl eframe::App for App {
                         if ui.button("Save (Ctrl-S)").clicked() { self.save_editor(); }
                         if ui.button("Cancel (Esc)").clicked() {
                             self.editor_text.clear();
+                            self.original_editor.clear();
                             self.view = View::Chooser;
                         }
                     });
@@ -168,7 +187,8 @@ impl eframe::App for App {
                                 ui.small(preview);
                                 if ui.button("Open").clicked() {
                                     let text = self.storage.read_note(&path).unwrap_or_default();
-                                    self.editor_text = text;
+                                    self.editor_text = text.clone();
+                                    self.original_editor = text;
                                     self.editor_path = Some(path.clone());
                                     self.editor_direction = self.config.default_direction;
                                     self.view = View::Editor;
