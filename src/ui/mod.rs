@@ -13,6 +13,7 @@ pub mod gtk;
 /// There is no "chooser" view on purpose: pressing the hotkey must land the
 /// caret in an empty note, not in a menu asking what to do next.
 pub enum View {
+    Chooser,
     Editor,
     Library,
     Settings,

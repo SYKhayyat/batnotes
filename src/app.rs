@@ -98,8 +98,8 @@ impl App {
             index,
             order,
             searcher,
-            view: View::Editor,
-            prev_view: View::Editor,
+            view: View::Chooser,
+            prev_view: View::Chooser,
             ed_id: None,
             ed_text: String::new(),
             ed_original: String::new(),
@@ -212,12 +212,12 @@ impl App {
     /// Invoke goes straight into an empty editor.
     ///
     /// There is deliberately no chooser on the hot path. Asking "new note or
-    /// my notes?" before you have written anything is itself the context shift
-    /// this app exists to avoid — you press the key, you type, you are gone.
+    /// Open on the chooser. The hotkey has to mean one thing, and "capture"
+    /// is not it — half the time the intent is "what did I write down?".
     pub fn show(&mut self) {
         self.visible = true;
         self.closing = false;
-        self.new_draft();
+        self.view = View::Chooser;
     }
 
     /// Close the overlay. Anything typed is saved first: the whole premise is
@@ -227,7 +227,7 @@ impl App {
             self.save_quiet(true);
         }
         self.visible = false;
-        self.view = View::Editor;
+        self.view = View::Chooser;
         self.ed_id = None;
         self.ed_text.clear();
         self.ed_original.clear();
@@ -365,7 +365,9 @@ impl App {
         self.ed_original_dir = self.ed_dir;
         self.ed_id = None;
         self.ed_is_new = true;
-        self.ed_return = View::Library;
+        // A new note was started from the chooser, so that is where saving
+        // should land. Opening one from the list returns to the list.
+        self.ed_return = View::Chooser;
         self.view = View::Editor;
         self.prompt = None;
         self.touched = false;
@@ -514,6 +516,7 @@ impl App {
             // no menu: Back is "I'm done here".
             Action::Back => match self.view {
                 View::Settings => self.view = self.prev_view,
+                View::Library => self.view = View::Chooser,
                 View::Editor => {
                     if self.dirty() {
                         self.prompt = Some(ui::PROMPT_CANCEL.into());
@@ -678,6 +681,10 @@ impl App {
     pub fn hints(&self) -> Vec<(Command, &'static str)> {
         let mut v: Vec<(Command, &'static str)> = vec![];
         match self.view {
+            View::Chooser => {
+                v.push((Command::NewNote, "new note"));
+                v.push((Command::OpenLibrary, "my notes"));
+            }
             View::Editor => {
                 v.push((Command::Save, "save"));
                 v.push((Command::SaveClose, "save & close"));
@@ -722,8 +729,8 @@ mod tests {
             index,
             order,
             searcher: Searcher::new(),
-            view: View::Editor,
-            prev_view: View::Editor,
+            view: View::Chooser,
+            prev_view: View::Chooser,
             ed_id: None,
             ed_text: String::new(),
             ed_original: String::new(),
@@ -812,13 +819,14 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut a = test_app(d.path());
         a.show();
+        a.dispatch(Action::NewNote);
         a.ed_text = "something".into();
         a.note_edited();
         a.hide();
         a.show();
         a.dispatch(Action::OpenLibrary);
         a.open_selected();
-        assert_eq!(a.view, View::Editor);
+        assert_eq!(a.view, View::Editor, "picking a note opens the editor");
         a.visible = true;
         a.dispatch(Action::Back);
         assert!(!a.visible, "Back means 'I am done here'");
@@ -853,13 +861,21 @@ mod tests {
     }
 
     #[test]
-    fn invoke_lands_the_caret_in_an_empty_note() {
+    fn invoke_offers_capture_or_review_and_new_note_is_empty() {
         let d = tempfile::tempdir().unwrap();
         let mut a = test_app(d.path());
         a.show();
-        assert_eq!(a.view, View::Editor, "capture must not route through a menu");
+        assert_eq!(
+            a.view,
+            View::Chooser,
+            "the hotkey must not guess between capturing and reviewing"
+        );
+        a.dispatch(Action::NewNote);
+        assert_eq!(a.view, View::Editor);
         assert!(a.ed_id.is_none());
         assert!(a.ed_text.is_empty());
+        a.dispatch(Action::Back);
+        assert_eq!(a.view, View::Chooser, "Back from the editor returns to the choice");
     }
 
     #[test]
@@ -867,6 +883,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut a = test_app(d.path());
         a.show();
+        a.dispatch(Action::NewNote);
         a.ed_text = "a passing thought".into();
         a.note_edited();
         a.hide();
@@ -883,6 +900,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut a = test_app(d.path());
         a.show();
+        a.dispatch(Action::NewNote);
         a.ed_text = "no key pressed".into();
         a.note_edited();
         assert!(!a.autosave(), "must wait for the debounce");
@@ -896,6 +914,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut a = test_app(d.path());
         a.show();
+        a.dispatch(Action::NewNote);
         a.last_edit = Some(Instant::now() - Duration::from_secs(5));
         assert!(!a.autosave());
         assert!(a.order.is_empty(), "no note may be written for an empty buffer");
@@ -906,6 +925,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut a = test_app(d.path());
         a.show();
+        a.dispatch(Action::NewNote);
         a.ed_text = "one".into();
         a.note_edited();
         a.last_edit = Some(Instant::now() - Duration::from_secs(2));
@@ -932,16 +952,18 @@ mod tests {
     }
 
     #[test]
-    fn every_invoke_starts_a_fresh_draft() {
+    fn every_capture_starts_a_fresh_draft() {
         let d = tempfile::tempdir().unwrap();
         let mut a = test_app(d.path());
         a.show();
+        a.dispatch(Action::NewNote);
         a.ed_text = "first thought".into();
         a.note_edited();
         a.hide();
         a.show();
-        assert!(a.ed_text.is_empty(), "each invoke is a new note");
-        assert!(a.ed_id.is_none(), "a new invoke is not editing the last note");
+        a.dispatch(Action::NewNote);
+        assert!(a.ed_text.is_empty(), "each capture is a new note");
+        assert!(a.ed_id.is_none(), "a new draft is not editing the last note");
         assert_eq!(a.order.len(), 1, "the first thought was still captured");
     }
 
@@ -950,6 +972,8 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let mut a = test_app(d.path());
         a.show();
+        assert!(a.hints().iter().any(|(c, _)| *c == Command::NewNote));
+        a.dispatch(Action::NewNote);
         assert!(a.hints().iter().any(|(c, _)| *c == Command::Save));
         a.dispatch(Action::OpenLibrary);
         assert!(a.hints().iter().any(|(c, _)| *c == Command::MoveUp));

@@ -159,26 +159,32 @@ pub struct Palette {
     pub ink_soft: String,
     pub ink_faint: String,
     pub accent: String,
+    /// Hover shade for the accent, kept configurable so the pair stays in step.
+    pub accent_deep: String,
     pub clay: String,
     pub rule: String,
     pub wash: String,
     pub danger: String,
+    pub danger_deep: String,
 }
 
 impl Default for Palette {
     fn default() -> Self {
-        // Prototype B's palette: warm paper, forest ink, sage accent.
         Palette {
             paper: "#fdfdf9".into(),
             paper_raised: "#ffffff".into(),
-            ink: "#253d31".into(),
-            ink_soft: "#7b8179".into(),
-            ink_faint: "#a6afa4".into(),
-            accent: "#4b7a5c".into(),
-            clay: "#c28b69".into(),
+            ink: "#2b3b30".into(),
+            // These two carry most of the small text in the app. The previous
+            // values sat near 2:1 on the paper background and were unreadable.
+            ink_soft: "#5c6759".into(),
+            ink_faint: "#6d7768".into(),
+            accent: "#31573e".into(),
+            accent_deep: "#244731".into(),
+            clay: "#9a6a3c".into(),
             rule: "#e4e9e0".into(),
             wash: "#f4f7f1".into(),
             danger: "#aa5e52".into(),
+            danger_deep: "#914d44".into(),
         }
     }
 }

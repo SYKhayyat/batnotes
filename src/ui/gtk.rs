@@ -33,6 +33,20 @@ pub struct Ui {
     rendered: RefCell<String>,
     /// View the current tree was built for, so resizing happens on change.
     current_view: RefCell<View>,
+    /// Widgets that outlive a rebuild.
+    ///
+    /// Rebuilding the whole tree is fine for static chrome, but it destroys
+    /// whatever had keyboard focus. That is what made clicking "New note"
+    /// close the window: the button was torn out from under the caret, GTK
+    /// dropped focus, and the focus-out handler read it as "the user left".
+    /// The editor is worse — it was destroyed on every keystroke.
+    editor_view: RefCell<Option<gtk4::TextView>>,
+    editor_status: RefCell<Option<gtk4::Label>>,
+    editor_count: RefCell<Option<gtk4::Label>>,
+    search_entry: RefCell<Option<gtk4::SearchEntry>>,
+    /// Set while we are deliberately taking focus, so the focus-out handler
+    /// does not mistake it for the user clicking away.
+    refocus: RefCell<bool>,
 }
 
 /// `window` is moved in and kept: GTK must not collect the only reference to
@@ -45,7 +59,12 @@ pub fn build(app: App, window: gtk4::Window) -> Rc<Ui> {
         toast: gtk4::Label::new(None),
         last_toast: RefCell::new(None),
         rendered: RefCell::new(String::new()),
-        current_view: RefCell::new(View::Editor),
+        current_view: RefCell::new(View::Library),
+        editor_view: RefCell::new(None),
+        editor_status: RefCell::new(None),
+        editor_count: RefCell::new(None),
+        search_entry: RefCell::new(None),
+        refocus: RefCell::new(false),
     });
     let rc2 = rc.clone();
     rc2.init();
@@ -56,7 +75,13 @@ impl Ui {
     fn init(self: &Rc<Self>) {
         let w = &self.window;
         w.set_title(Some("batnotes"));
+        // A titlebar and square corners are what made this read as a dialog
+        // instead of something that floats above your work.
         w.set_decorated(false);
+        // An undecorated toplevel will map but never take keyboard focus, so
+        // every binding silently did nothing.
+        w.set_focusable(true);
+        w.set_can_focus(true);
         // Keep the overlay above ordinary windows without becoming a panel
         // that steals input from whatever the user is actually doing.
         w.set_modal(false);
@@ -75,11 +100,8 @@ impl Ui {
             );
         }
 
-        self.root.set_margin_top(14);
-        self.root.set_margin_bottom(14);
-        self.root.set_margin_start(18);
-        self.root.set_margin_end(18);
-        self.root.set_spacing(10);
+        self.root.add_css_class("root");
+        self.root.set_spacing(0);
         w.set_child(Some(&self.root));
 
         self.toast.add_css_class("toast");
@@ -90,7 +112,7 @@ impl Ui {
         self.clone().render_all();
         // current_view is seeded with Editor, so the change-gated resize in
         // rebuild() never fires for the view we open in.
-        self.apply_size(View::Editor);
+        self.apply_size(View::Chooser);
     }
 
     // ---- window control -------------------------------------------------
@@ -100,14 +122,18 @@ impl Ui {
     /// should, which is itself a distraction.
     fn apply_size(&self, view: View) {
         let (w, h) = match view {
-            View::Editor => (560, 240),
-            View::Library | View::Settings => (660, 560),
+            View::Chooser => (640, 440),
+            View::Editor => (640, 520),
+            View::Library | View::Settings => (700, 600),
         };
         self.window.set_default_size(w, h);
     }
 
     pub fn show(&self) {
         self.window.present();
+        // present() asks the compositor for focus; asking the window as well
+        // covers the case where it is already mapped and merely re-shown.
+        self.window.grab_focus();
     }
 
     pub fn hide(&self) {
@@ -173,6 +199,7 @@ impl Ui {
             self.root.remove(&c);
         }
         let app = self.app.borrow();
+        let app_view = app.view;
         let confirm_id = app.confirm_delete.clone();
         // Capture stays bare. The list and settings can afford a key legend.
         let show_hints = matches!(app.view, View::Library | View::Settings);
@@ -181,6 +208,7 @@ impl Ui {
             self.apply_size(app.view);
         }
         match app.view {
+            View::Chooser => self.build_chooser(&app),
             View::Editor => self.build_editor(&app),
             View::Library => self.build_library(&app),
             View::Settings => self.build_settings(&app),
@@ -204,11 +232,29 @@ impl Ui {
             let ui = self.clone();
             self.root.append(&ui.delete_overlay(id));
         }
+
+        // Put the caret back where the user expects it. Without this the
+        // window opens focused on nothing and typing goes nowhere.
+        let want = match app_view {
+            View::Editor => self.editor_view.borrow().is_some(),
+            View::Library | View::Settings | View::Chooser => false,
+        };
+        if want {
+            *self.refocus.borrow_mut() = true;
+            if let Some(v) = self.editor_view.borrow().as_ref() {
+                v.grab_focus();
+            }
+        }
     }
 
+    /// Rebuild only when something visible changed.
     fn render_all(self: Rc<Self>) {
+        let sig = self.signature();
+        if *self.rendered.borrow() == sig {
+            return;
+        }
         self.clone().rebuild();
-        *self.rendered.borrow_mut() = self.signature();
+        *self.rendered.borrow_mut() = sig;
     }
 
     // ---- actions ---------------------------------------------------------
@@ -400,76 +446,305 @@ impl Ui {
     /// one quiet line of status, and nothing that asks for a decision. Every
     /// control here is something the user has to *not* think about while
     /// trying to hold onto a thought.
+    /// Update the editor's status line and counters without touching the tree.
+    fn refresh_editor_chrome(self: &Rc<Self>) {
+        let (dirty, touched, text, words, lines, width) = {
+            let a = self.app.borrow();
+            (
+                a.dirty(),
+                a.touched,
+                a.ed_text.len(),
+                a.ed_text.split_whitespace().count(),
+                a.ed_text.lines().count(),
+                0,
+            )
+        };
+        let _ = width;
+        if let Some(l) = self.editor_status.borrow().as_ref() {
+            let (txt, cls) = if dirty {
+                ("saving\u{2026}", "warn")
+            } else if touched {
+                ("saved", "ok")
+            } else {
+                ("", "ok")
+            };
+            if l.text() != txt {
+                l.set_text(txt);
+            }
+            if !l.has_css_class(cls) {
+                l.remove_css_class(if cls == "warn" { "ok" } else { "warn" });
+                l.add_css_class(cls);
+            }
+        }
+        if let Some(l) = self.editor_count.borrow().as_ref() {
+            l.set_text(&format!("{text} chars \u{00b7} {words} words \u{00b7} {lines} lines"));
+        }
+    }
+
+    /// A padded content column. The card keeps the rounded corners; the
+    /// content stays clear of them.
+    fn page(&self) -> gtk4::Box {
+        let b = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        b.set_margin_top(22);
+        b.set_margin_bottom(18);
+        b.set_margin_start(28);
+        b.set_margin_end(28);
+        b
+    }
+
+    /// The opening screen. Two choices, no more: capture something, or go
+    /// look at what you already have. One hotkey can only mean one thing,
+    /// and the point of the overlay is to get out of the way again.
+    fn build_chooser(self: &Rc<Self>, app: &App) {
+        let col = self.page();
+
+        let over = gtk4::Label::new(Some("CAPTURE OR REVIEW"));
+        over.add_css_class("overline");
+        over.set_xalign(0.0);
+        col.append(&over);
+
+        let h = gtk4::Label::new(Some("What do you want to do?"));
+        h.add_css_class("display");
+        h.set_xalign(0.0);
+        set_direction(&h, app.config.default_direction);
+        col.append(&h);
+
+        let sub = gtk4::Label::new(Some(
+            "Notes are plain text files on disk. Nothing leaves this machine.",
+        ));
+        sub.add_css_class("lede");
+        sub.set_xalign(0.0);
+        sub.set_wrap(true);
+        col.append(&sub);
+
+        let gap = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        gap.set_margin_top(14);
+        col.append(&gap);
+
+        col.append(&self.clone().choice_row(
+            "\u{270f}",
+            "New note",
+            "Blank page, cursor ready. Type, save, gone.",
+            &ui::pretty_key(&app.config.binding(Command::NewNote)),
+            Action::NewNote,
+        ));
+
+        let hebrew = app
+            .order
+            .iter()
+            .filter(|id| {
+                app.index
+                    .get(id)
+                    .map(|d| d.direction == Direction::Rtl)
+                    .unwrap_or(false)
+            })
+            .count();
+        let detail = if app.order.is_empty() {
+            "Nothing here yet \u{2014} start with a new note".to_string()
+        } else {
+            format!(
+                "{} note{} \u{00b7} {} Hebrew \u{00b7} search, reopen, delete",
+                app.order.len(),
+                if app.order.len() == 1 { "" } else { "s" },
+                hebrew
+            )
+        };
+        col.append(&self.clone().choice_row(
+            "\u{25a6}",
+            "My notes",
+            &detail,
+            &ui::pretty_key(&app.config.binding(Command::OpenLibrary)),
+            Action::ShowLibrary,
+        ));
+
+        let foot = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
+        let hint = gtk4::Label::new(Some(&format!(
+            "Press {} any time to dismiss",
+            ui::pretty_key(&app.config.binding(Command::Invoke))
+        )));
+        hint.add_css_class("chooser-foot");
+        hint.set_xalign(0.0);
+        hint.set_hexpand(true);
+        foot.append(&hint);
+
+        let close = gtk4::Button::with_label("\u{2715}  Close");
+        close.add_css_class("ghost");
+        close.set_tooltip_text(Some(&format!(
+            "{}",
+            ui::pretty_key(&app.config.binding(Command::Back))
+        )));
+        close.connect_clicked({
+            let ui = self.clone();
+            move |_| ui.clone().dispatch(Action::Close)
+        });
+        foot.append(&close);
+        col.append(&foot);
+
+        self.root.append(&col);
+    }
+
+    /// One full-width destination row. Deliberately not a grid of cards: a
+    /// list reads as a menu you can move through, which is faster than
+    /// hunting for the right tile.
+    fn choice_row(
+        self: &Rc<Self>,
+        icon: &str,
+        title: &str,
+        detail: &str,
+        key: &str,
+        action: Action,
+    ) -> gtk4::Button {
+        let row = gtk4::Button::new();
+        row.add_css_class("choice-row");
+
+        let box_ = gtk4::Box::new(gtk4::Orientation::Horizontal, 16);
+        let ic = gtk4::Label::new(Some(icon));
+        ic.add_css_class("choice-icon");
+        box_.append(&ic);
+
+        let texts = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+        let t = gtk4::Label::new(Some(title));
+        t.add_css_class("choice-title");
+        t.set_xalign(0.0);
+        texts.append(&t);
+        let d = gtk4::Label::new(Some(detail));
+        d.add_css_class("choice-count");
+        d.set_xalign(0.0);
+        d.set_wrap(true);
+        texts.append(&d);
+        box_.append(&texts);
+
+        let kbd = gtk4::Label::new(Some(key));
+        kbd.add_css_class("kbd");
+        box_.append(&kbd);
+
+        let arrow = gtk4::Label::new(Some("\u{2192}"));
+        arrow.add_css_class("choice-arrow");
+        box_.append(&arrow);
+
+        row.set_child(Some(&box_));
+        row.connect_clicked({
+            let ui = self.clone();
+            move |_| ui.clone().dispatch(action.clone())
+        });
+        row
+    }
+
     fn build_editor(self: &Rc<Self>, app: &App) {
-        let col = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        let col = self.page();
 
         let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        // The title, not the filename. The id is opaque and meaningless to a
+        // person; in the list it read as noise.
         let label: String = match &app.ed_id {
-            Some(id) => format!("{id}.txt"),
-            None => "new note".to_string(),
+            Some(id) => app
+                .index
+                .get(id)
+                .map(|d| d.title.as_str().to_string())
+                .unwrap_or_else(|| "Note".to_string()),
+            None => "New note".to_string(),
         };
         let name = gtk4::Label::new(Some(&label));
-        name.add_css_class("subtitle");
+        name.add_css_class("section-title");
         name.set_xalign(0.0);
         name.set_hexpand(true);
+        name.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
         set_direction(&name, app.ed_dir);
         head.append(&name);
 
-        let state = gtk4::Label::new(Some(if app.dirty() {
-            "saving\u{2026}"
-        } else if app.touched {
-            "saved"
-        } else {
-            ""
-        }));
-        state.add_css_class(if app.dirty() { "warn" } else { "ok" });
+        let state = match self.editor_status.borrow_mut().take() {
+            Some(l) => l,
+            None => {
+                let l = gtk4::Label::new(None);
+                l.add_css_class("ok");
+                l
+            }
+        };
         head.append(&state);
+        self.refresh_editor_chrome();
         col.append(&head);
         col.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-        let view = gtk4::TextView::new();
-        view.set_wrap_mode(gtk4::WrapMode::WordChar);
-        view.set_hexpand(true);
-        view.set_vexpand(true);
-        view.add_css_class("note");
-        view.set_top_margin(12);
-        view.set_bottom_margin(12);
-        view.set_left_margin(14);
-        view.set_right_margin(14);
+        // Reuse the live TextView. A new one per keystroke destroyed the
+        // buffer the user was typing into and lost the caret every character.
+        let view = match self.editor_view.borrow_mut().take() {
+            Some(v) => v,
+            None => {
+                let v = gtk4::TextView::new();
+                v.set_wrap_mode(gtk4::WrapMode::WordChar);
+                v.set_hexpand(true);
+                v.set_vexpand(true);
+                v.add_css_class("note");
+                v.add_css_class("writing");
+                v.set_top_margin(14);
+                v.set_bottom_margin(14);
+                v.set_left_margin(16);
+                v.set_right_margin(16);
 
-        let buffer = view.buffer();
-        buffer.set_text(&app.ed_text);
-        set_direction(&view, app.ed_dir);
-
-        buffer.connect_changed({
-            let ui = self.clone();
-            move |b| {
-                let text = b.text(&b.start_iter(), &b.end_iter(), false).to_string();
-                let mut app = ui.app.borrow_mut();
-                if app.ed_text != text {
-                    app.ed_text = text;
-                    app.note_edited();
-                    drop(app);
-                    ui.clone().render_all();
-                }
+                let buffer = v.buffer();
+                buffer.connect_changed({
+                    let ui = self.clone();
+                    move |b| {
+                        let text = b.text(&b.start_iter(), &b.end_iter(), false).to_string();
+                        let mut app = ui.app.borrow_mut();
+                        if app.ed_text == text {
+                            return;
+                        }
+                        app.ed_text = text;
+                        app.note_edited();
+                        drop(app);
+                        // Update in place. Rebuilding here would destroy the
+                        // view this very handler belongs to.
+                        ui.refresh_editor_chrome();
+                    }
+                });
+                v
             }
-        });
+        };
+        let buffer = view.buffer();
+        if buffer.text(&buffer.start_iter(), &buffer.end_iter(), false).to_string() != app.ed_text {
+            buffer.set_text(&app.ed_text);
+        }
+        set_direction(&view, app.ed_dir);
         col.append(&view);
 
         let foot = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let count = gtk4::Label::new(Some(&self.stats(app)));
+        let count = match self.editor_count.borrow_mut().take() {
+            Some(l) => l,
+            None => {
+                let l = gtk4::Label::new(None);
+                l.add_css_class("subtitle");
+                *self.editor_count.borrow_mut() = Some(l.clone());
+                l
+            }
+        };
         count.add_css_class("subtitle");
         count.set_xalign(0.0);
         count.set_hexpand(true);
         foot.append(&count);
 
-        let hint = gtk4::Label::new(Some(&format!(
-            "{} save & close   \u{00b7}   {} close",
-            ui::pretty_key(&app.config.binding(Command::SaveClose)),
+        // Keyboard alone is not an interface. Capture needs a visible way to
+        // reach the list and a visible way out.
+        let notes = gtk4::Button::with_label("\u{25a6}  My notes");
+        notes.add_css_class("ghost");
+        notes.set_tooltip_text(Some(&ui::pretty_key(&app.config.binding(Command::ShowLibrary))));
+        notes.connect_clicked({
+            let ui = self.clone();
+            move |_| ui.clone().dispatch(Action::ShowLibrary)
+        });
+        foot.append(&notes);
+
+        let close = gtk4::Button::with_label("\u{2715}");
+        close.add_css_class("flat");
+        close.set_tooltip_text(Some(&format!(
+            "Close ({})",
             ui::pretty_key(&app.config.binding(Command::Back))
         )));
-        hint.add_css_class("subtitle");
-        foot.append(&hint);
+        close.connect_clicked({
+            let ui = self.clone();
+            move |_| ui.clone().dispatch(Action::Close)
+        });
+        foot.append(&close);
         col.append(&foot);
 
         self.root.append(&col);
@@ -489,8 +764,21 @@ impl Ui {
     // ---- library -------------------------------------------------------------
 
     fn build_library(self: &Rc<Self>, app: &App) {
-        let col = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-        col.append(&self.clone().header(format!("{} notes", app.order.len())));
+        let col = self.page();
+        col.set_spacing(8);
+
+        let h = gtk4::Label::new(Some("My notes"));
+        h.add_css_class("display");
+        h.set_xalign(0.0);
+        col.append(&h);
+        let count = gtk4::Label::new(Some(&format!(
+            "{} note{} on disk \u{00b7} search by title, file or content",
+            app.order.len(),
+            if app.order.len() == 1 { "" } else { "s" }
+        )));
+        count.add_css_class("lede");
+        count.set_xalign(0.0);
+        col.append(&count);
 
         // Adding from the list: the review flow is also a place you notice
         // you need another note, and there is no capture key to hand.
@@ -503,13 +791,30 @@ impl Ui {
         });
         col.append(&add);
 
-        let search = gtk4::SearchEntry::new();
-        search.set_text(&app.query);
-        search.set_placeholder_text(Some("Search titles, filenames & content…"));
-        search.connect_search_changed({
-            let ui = self.clone();
-            move |e| ui.clone().dispatch(Action::SetQuery(e.text().to_string()))
-        });
+        // Same reason as the text view: rebuilding on every keystroke of the
+        // search box destroyed the entry mid-search.
+        let search = match self.search_entry.borrow_mut().take() {
+            Some(e) => e,
+            None => {
+                let e = gtk4::SearchEntry::new();
+                e.set_placeholder_text(Some("Search titles and content\u{2026}"));
+                e.connect_search_changed({
+                    let ui = self.clone();
+                    move |ent| {
+                        let mut app = ui.app.borrow_mut();
+                        if app.query == ent.text().to_string() {
+                            return;
+                        }
+                        drop(app);
+                        ui.clone().dispatch(Action::SetQuery(ent.text().to_string()));
+                    }
+                });
+                e
+            }
+        };
+        if search.text().to_string() != app.query {
+            search.set_text(&app.query);
+        }
         col.append(&search);
 
         let list = gtk4::ListBox::new();
@@ -539,6 +844,18 @@ impl Ui {
         }
 
         let footer = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let new = gtk4::Button::with_label("+  New note");
+        new.add_css_class("primary");
+        new.connect_clicked({
+            let ui = self.clone();
+            move |_| ui.clone().dispatch(Action::NewNote)
+        });
+        footer.append(&new);
+
+        let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        footer.append(&spacer);
+
         let back = gtk4::Button::with_label("Back");
         back.add_css_class("ghost");
         back.connect_clicked({
@@ -547,9 +864,13 @@ impl Ui {
         });
         footer.append(&back);
 
-        let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        footer.append(&spacer);
+        let close = gtk4::Button::with_label("\u{2715}");
+        close.add_css_class("flat");
+        close.connect_clicked({
+            let ui = self.clone();
+            move |_| ui.clone().dispatch(Action::Close)
+        });
+        footer.append(&close);
 
         let up = gtk4::Button::with_label("↑ move");
         up.add_css_class("ghost");
@@ -972,6 +1293,13 @@ impl Ui {
                 // clicking a control closes the overlay before it is pressed.
                 let ui2 = ui.clone();
                 glib::timeout_add_local_once(Duration::from_millis(60), move || {
+                    // A rebuild briefly drops focus while we move it back.
+                    // Treating that as "the user left" closed the overlay the
+                    // instant a button was clicked.
+                    if *ui2.refocus.borrow() {
+                        *ui2.refocus.borrow_mut() = false;
+                        return;
+                    }
                     if ui2.app.borrow().visible {
                         ui2.app.borrow_mut().on_focus_loss();
                         ui2.clone().render_all();
@@ -983,56 +1311,142 @@ impl Ui {
 
     // ---- styling ----------------------------------------------------------------
 
+    /// The visual language. Sizes are quiet and surfaces are flat, but every
+    /// interactive edge is rounded and every state change is animated: that
+    /// is the difference between a dialog and something that floats.
     fn css(&self) -> String {
         let p = &self.app.borrow().config.palette;
         let c = |s: &str| config::parse_colour(s).map(|c| c.css()).unwrap_or_default();
+        let wash = |s: &str, a: f64| {
+            config::parse_colour(s)
+                .map(|x| {
+                    format!(
+                        "rgba({},{},{},{a})",
+                        (x.r * 255.0) as u8,
+                        (x.g * 255.0) as u8,
+                        (x.b * 255.0) as u8
+                    )
+                })
+                .unwrap_or_default()
+        };
         format!(
             r#"
-window {{ background: {paper}; }}
-.brand {{ font-weight: 700; font-size: 15px; color: {ink}; }}
-.subtitle {{ color: {faint}; font-size: 11px; }}
-.mono {{ font-family: monospace; font-size: 11px; color: {soft}; }}
-.warn {{ color: {clay}; font-size: 11px; }}
-.ok {{ color: {accent}; font-size: 11px; }}
-.segmented {{ }}
-.choice {{ padding: 14px 16px; }}
-.choice:hover {{ background: {wash}; }}
-.choice-icon {{ font-size: 17px; color: {accent}; }}
-.choice-title {{ font-size: 15px; font-weight: 600; color: {ink}; }}
-.choice-count {{ color: {faint}; font-size: 12px; }}
-.resume {{ padding: 8px 12px; margin-top: 4px; }}
-.resume:hover {{ background: {wash}; }}
-.resume-title {{ font-size: 12px; color: {soft}; }}
-.kbd {{
-  font-family: monospace; font-size: 10px; padding: 2px 6px; margin: 0 1px;
-  border-radius: 4px; background: {wash}; color: {soft};
+/* The window itself is the rounded card. Transparency lets the corners be
+   real; the compositor does the soft shadow. */
+window {{ background: transparent; }}
+.root {{
+  background: {paper};
   border: 1px solid {rule};
+  border-radius: 16px;
+  box-shadow: 0 18px 46px {shade}, 0 2px 8px {shade2};
+}}
+
+.brand {{ font-weight: 700; font-size: 14px; color: {ink}; letter-spacing: -0.01em; }}
+.subtitle {{ color: {soft}; font-size: 12px; }}
+.mono {{ font-family: monospace; font-size: 11px; color: {soft}; }}
+.warn {{ color: {danger}; font-size: 11.5px; }}
+.ok {{ color: {accent}; font-size: 11.5px; }}
+
+/* --- chooser --- */
+.overline {{
+  font-size: 10.5px; font-weight: 750; color: {accent}; letter-spacing: 0.16em;
+  margin-top: 6px;
+}}
+.display {{
+  font-family: {serif}; font-weight: 400; font-size: 34px;
+  letter-spacing: -0.03em; color: {ink}; margin-top: 10px;
+}}
+.lede {{ color: {soft}; font-size: 13px; margin-top: 8px; }}
+
+.choice-row {{
+  background: transparent; border: none; border-bottom: 1px solid {rule};
+  border-radius: 0; padding: 15px 6px; min-height: 76px;
+  transition: padding 180ms ease, background 180ms ease;
+}}
+.choice-row:hover {{ background: {wash}; padding-left: 14px; padding-right: 10px; }}
+.choice-icon {{
+  font-size: 19px; color: {accent}; background: {wash};
+  min-width: 44px; min-height: 44px; border-radius: 12px;
+}}
+.choice-title {{ font-size: 16px; font-weight: 650; color: {ink}; letter-spacing: -0.02em; }}
+.choice-count {{ color: {soft}; font-size: 12.5px; }}
+.choice-arrow {{ color: {faint}; font-size: 15px; transition: transform 180ms ease; }}
+.choice-row:hover .choice-arrow {{ transform: translateX(4px); color: {accent}; }}
+
+.resume {{
+  background: transparent; border: 1px dashed {rule}; border-radius: 10px;
+  padding: 10px 12px; margin-top: 16px; transition: border-color 160ms ease, background 160ms ease;
+}}
+.resume:hover {{ border-color: {accent}; background: {wash}; }}
+.resume-title {{ font-size: 12.5px; font-weight: 600; color: {ink}; }}
+.resume-meta {{ font-size: 11px; color: {soft}; }}
+.resume-icon {{ color: {soft}; font-size: 14px; }}
+.resume-arrow {{ color: {soft}; font-size: 13px; }}
+.chooser-foot {{ color: {soft}; font-size: 11.5px; margin-top: 18px; }}
+
+.kbd {{
+  font-family: monospace; font-size: 10.5px; padding: 4px 7px;
+  border-radius: 5px; background: {wash}; color: {ink};
+  border: 1px solid {rule}; box-shadow: 0 1px 0 {rule};
 }}
 .kbd.conflict {{ border-color: {danger}; color: {danger}; }}
-.note-surface {{ background: {raised}; border: 1px solid {rule}; border-radius: 8px; }}
-.note {{ background: transparent; color: {ink}; font-size: 15px; }}
-.library, .keys {{ background: transparent; }}
-.note-row {{ padding: 9px 10px; border-radius: 8px; }}
-.note-row.selected {{ background: {wash}; }}
-.note-title {{ font-weight: 700; font-size: 13.5px; color: {ink}; }}
-.note-preview {{ color: {soft}; font-size: 12px; }}
-.badge-rtl, .badge-ltr {{
-  font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 7px;
+
+/* --- editor --- */
+.note {{ background: transparent; color: {ink}; font-size: 15px; caret-color: {accent}; }}
+.writing {{
+  background: transparent;
+  background-image: repeating-linear-gradient(to bottom, transparent 0, transparent 35px, {rule} 35px, {rule} 36px);
+  border: 1px solid {rule}; border-radius: 10px; transition: border-color 160ms ease;
 }}
+.writing:focus {{ border-color: {accent}; }}
+.section-title {{ font-family: {serif}; font-weight: 400; font-size: 26px; color: {ink}; letter-spacing: -0.02em; }}
+
+/* --- library --- */
+.note-row {{
+  padding: 13px 10px; border-radius: 10px; border-bottom: 1px solid {rule};
+  transition: background 150ms ease, padding 150ms ease;
+}}
+.note-row:hover {{ background: {wash}; padding-left: 14px; }}
+.note-row.selected {{ background: {wash}; border-left: 2px solid {accent}; }}
+.note-title {{ font-weight: 650; font-size: 14px; color: {ink}; }}
+.note-preview {{ color: {soft}; font-size: 12.5px; }}
+.badge-rtl, .badge-ltr {{ font-size: 9.5px; font-weight: 700; padding: 2px 7px; border-radius: 6px; }}
 .badge-rtl {{ background: {claywash}; color: {clay}; }}
-.badge-ltr {{ background: {wash}; color: {faint}; }}
-.hintbar {{ margin-top: 10px; padding-top: 8px; border-top: 1px solid {rule}; }}
-.hintlabel {{ color: {faint}; font-size: 10.5px; }}
-.banner {{ padding: 9px 11px; border-radius: 7px; background: {wash}; }}
+.badge-ltr {{ background: {wash}; color: {soft}; }}
+
+.hintbar {{ margin-top: 10px; padding-top: 9px; border-top: 1px solid {rule}; }}
+.hintlabel {{ color: {soft}; font-size: 11px; }}
+
+.banner {{ padding: 10px 12px; border-radius: 9px; background: {wash}; }}
 .banner-warn {{ background: {claywash}; }}
 .banner-danger {{ background: {dangerwash}; }}
-.primary {{ background: {accent}; color: #ffffff; border: none; border-radius: 7px; padding: 7px 13px; font-weight: 600; }}
-.ghost, .flat {{ background: transparent; border: 1px solid {rule}; color: {soft}; border-radius: 7px; padding: 6px 11px; }}
+.primary {{
+  background: {accent}; color: #ffffff; border: none; border-radius: 8px;
+  padding: 9px 15px; font-weight: 620; transition: background 150ms ease, transform 150ms ease;
+}}
+.primary:hover {{ background: {accentdeep}; }}
+.primary:active {{ transform: translateY(1px); }}
+.ghost, .flat {{
+  background: transparent; border: 1px solid {rule}; color: {ink};
+  border-radius: 8px; padding: 8px 12px; transition: background 150ms ease, border-color 150ms ease;
+}}
 .flat {{ border: none; }}
-.ghost:hover, .flat:hover {{ background: {wash}; color: {ink}; }}
-.toast {{ background: {ink}; color: {paper}; border-radius: 15px; padding: 7px 15px; font-size: 12px; }}
+.ghost:hover, .flat:hover {{ background: {wash}; border-color: {accent}; }}
+.danger {{ background: {danger}; color: #ffffff; border: none; border-radius: 8px; padding: 9px 15px; font-weight: 620; }}
+.danger:hover {{ background: {dangerdeep}; }}
+.toast {{
+  background: {accent}; color: #ffffff; border-radius: 16px;
+  padding: 9px 16px; font-size: 12px; margin-top: 10px;
+}}
 .conflict {{ background: {dangerwash}; }}
-on {{ background: {accent}; color: #ffffff; }}
+.on {{ background: {accent}; color: #ffffff; }}
+
+.scrim {{ background: {scrim}; border-radius: 16px; }}
+.confirm-panel {{
+  background: {raised}; border: 1px solid {rule}; border-radius: 14px;
+  padding: 20px; margin: 40px; box-shadow: 0 14px 34px {shade};
+}}
+.dialog-title {{ font-family: {serif}; font-weight: 400; font-size: 22px; color: {ink}; }}
 "#,
             paper = c(&p.paper),
             raised = c(&p.paper_raised),
@@ -1040,16 +1454,18 @@ on {{ background: {accent}; color: #ffffff; }}
             soft = c(&p.ink_soft),
             faint = c(&p.ink_faint),
             accent = c(&p.accent),
+            accentdeep = c(&p.accent_deep),
             clay = c(&p.clay),
             rule = c(&p.rule),
             wash = c(&p.wash),
             danger = c(&p.danger),
-            claywash = config::parse_colour(&p.clay)
-                .map(|x| format!("rgba({},{},{},0.13)", (x.r * 255.0) as u8, (x.g * 255.0) as u8, (x.b * 255.0) as u8))
-                .unwrap_or_default(),
-            dangerwash = config::parse_colour(&p.danger)
-                .map(|x| format!("rgba({},{},{},0.10)", (x.r * 255.0) as u8, (x.g * 255.0) as u8, (x.b * 255.0) as u8))
-                .unwrap_or_default(),
+            claywash = wash(&p.clay, 0.14),
+            dangerdeep = c(&p.danger_deep),
+            dangerwash = wash(&p.danger, 0.11),
+            scrim = wash("#1a2a1d", 0.30),
+            shade = wash("#1a2a1d", 0.16),
+            shade2 = wash("#1a2a1d", 0.07),
+            serif = "Georgia, 'DejaVu Serif', 'Noto Serif', serif".to_string(),
         )
     }
 }
@@ -1096,6 +1512,26 @@ fn set_direction(w: &impl IsA<gtk4::Widget>, dir: Direction) {
 }
 
 /// Which command (if any) the released key combination means.
+/// Relative time from the file's mtime. Notes are files, so that is the only
+/// timestamp there is — and it is the one the filesystem agrees on.
+fn pretty_ago(path: &std::path::Path) -> String {
+    let modified = std::fs::metadata(path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+    let secs = modified.map(|d| d.as_secs()).unwrap_or(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(secs);
+    match now.saturating_sub(secs) {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{}m ago", (now - secs) / 60),
+        3600..=86399 => format!("{}h ago", (now - secs) / 3600),
+        _ => format!("{}d ago", (now - secs) / 86400),
+    }
+}
+
 fn action_for(ui: &Ui, combo: &str) -> Option<Action> {
     let spec = crate::hotkey::HotkeySpec::parse(combo).ok()?;
     let norm = spec.normalised();
@@ -1117,7 +1553,7 @@ fn action_for(ui: &Ui, combo: &str) -> Option<Action> {
         Command::Invoke | Command::ToggleOverlay => Action::Close,
         Command::NewNote => Action::NewNote,
         Command::OpenLibrary => match app.view {
-            View::Editor => Action::ShowLibrary,
+            View::Chooser => Action::ShowLibrary,
             _ => Action::OpenLibrary,
         },
         Command::ShowLibrary => Action::ShowLibrary,

@@ -740,7 +740,6 @@ const KDESKTOP_UUID: &str = "b4a7notes000000000000000000000001";
 pub fn install_desktop_shortcut(spec: &HotkeySpec, notes: &HotkeySpec) -> Result<()> {
     let exe = std::env::current_exe()?;
     let capture = format!("{} --show", exe.display());
-    let library = format!("{} --show-notes", exe.display());
 
     let apps = dirs::data_dir()
         .ok_or_else(|| anyhow!("no XDG data dir"))?
