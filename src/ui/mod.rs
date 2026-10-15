@@ -329,6 +329,20 @@ mod tests {
     #[test]
     fn named_keys_map_to_our_syntax() {
         let m = ModifierType::empty();
+        // A bare letter must resolve to the binding's spelling, case
+        // included, or New note ("A") and Back never fire.
+        let a = combo_from(&Key::a, 30, &ModifierType::empty());
+        assert_eq!(a.as_deref(), Some("A"));
+        assert_eq!(
+            crate::hotkey::HotkeySpec::parse(a.as_deref().unwrap())
+                .map(|s| s.normalised())
+                .unwrap_or_default(),
+            crate::hotkey::HotkeySpec::parse("A")
+                .map(|s| s.normalised())
+                .unwrap_or_default(),
+            "pressing A must match the New note binding"
+        );
+
         assert_eq!(combo_from(&Key::space, 57, &m).as_deref(), Some("Space"));
         assert_eq!(combo_from(&Key::Escape, 1, &m).as_deref(), Some("Escape"));
         // evdev 51 is comma, 103 is Up.

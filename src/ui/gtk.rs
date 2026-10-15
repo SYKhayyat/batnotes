@@ -271,11 +271,11 @@ impl Ui {
             this.clone().render_all();
         }));
         if outcome.is_err() {
+            // Do not touch the widget tree here. Disposing it re-enters GTK
+            // signal handlers, and a second panic across the extern "C"
+            // boundary aborts the process rather than unwinding — which turns
+            // a cosmetic fault into a dead daemon.
             eprintln!("batnotes: a widget handler panicked; recovered");
-            if let Some(w) = self.window.child() {
-                self.window.set_child(None::<&gtk4::Widget>);
-                drop(w);
-            }
         }
     }
 
@@ -652,7 +652,8 @@ impl Ui {
         set_direction(&name, app.ed_dir);
         head.append(&name);
 
-        let state = match self.editor_status.borrow_mut().take() {
+        let cached = self.editor_status.borrow_mut().take();
+        let state = match cached {
             Some(l) => l,
             None => {
                 let l = gtk4::Label::new(None);
@@ -660,6 +661,7 @@ impl Ui {
                 l
             }
         };
+        *self.editor_status.borrow_mut() = Some(state.clone());
         head.append(&state);
         self.refresh_editor_chrome();
         col.append(&head);
@@ -709,18 +711,21 @@ impl Ui {
         col.append(&view);
 
         let foot = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let count = match self.editor_count.borrow_mut().take() {
+        // Take before matching: a temporary borrow in the match scrutinee is
+        // held for the whole match, so touching the cell inside an arm
+        // panics with "already borrowed".
+        let cached = self.editor_count.borrow_mut().take();
+        let count = match cached {
             Some(l) => l,
             None => {
                 let l = gtk4::Label::new(None);
                 l.add_css_class("subtitle");
-                *self.editor_count.borrow_mut() = Some(l.clone());
                 l
             }
         };
-        count.add_css_class("subtitle");
         count.set_xalign(0.0);
         count.set_hexpand(true);
+        *self.editor_count.borrow_mut() = Some(count.clone());
         foot.append(&count);
 
         // Keyboard alone is not an interface. Capture needs a visible way to
@@ -793,7 +798,8 @@ impl Ui {
 
         // Same reason as the text view: rebuilding on every keystroke of the
         // search box destroyed the entry mid-search.
-        let search = match self.search_entry.borrow_mut().take() {
+        let cached = self.search_entry.borrow_mut().take();
+        let search = match cached {
             Some(e) => e,
             None => {
                 let e = gtk4::SearchEntry::new();
@@ -815,6 +821,7 @@ impl Ui {
         if search.text().to_string() != app.query {
             search.set_text(&app.query);
         }
+        *self.search_entry.borrow_mut() = Some(search.clone());
         col.append(&search);
 
         let list = gtk4::ListBox::new();
