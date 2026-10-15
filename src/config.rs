@@ -14,6 +14,8 @@ pub enum Command {
     ToggleOverlay,
     NewNote,
     OpenLibrary,
+    /// Editor to library, without losing the buffer.
+    ShowLibrary,
     FocusSearch,
     Save,
     SaveClose,
@@ -41,6 +43,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::MoveDown,
     Command::ToggleDirection,
     Command::TogglePreviewLines,
+    Command::ShowLibrary,
 ];
 
 impl Command {
@@ -50,6 +53,7 @@ impl Command {
             Command::ToggleOverlay => "Show overlay",
             Command::NewNote => "Chooser → New note",
             Command::OpenLibrary => "Chooser → My notes",
+            Command::ShowLibrary => "Editor → My notes",
             Command::FocusSearch => "Focus library search",
             Command::Save => "Save note (stay open)",
             Command::SaveClose => "Save note and close",
@@ -69,6 +73,7 @@ impl Command {
             Command::ToggleOverlay => "Global. Toggles the overlay.",
             Command::NewNote => "From the chooser.",
             Command::OpenLibrary => "From the chooser.",
+            Command::ShowLibrary => "From the editor, without discarding the draft.",
             Command::FocusSearch => "In the library.",
             Command::Save => "Keeps you in the editor.",
             Command::SaveClose => "Returns you to the chooser.",
@@ -97,6 +102,7 @@ fn defaults() -> Vec<(Command, &'static str)> {
         (Command::ToggleOverlay, "Meta+Shift+Space"),
         (Command::NewNote, "A"),
         (Command::OpenLibrary, "B"),
+        (Command::ShowLibrary, "Alt+B"),
         (Command::FocusSearch, "Slash"),
         (Command::Save, "Ctrl+S"),
         (Command::SaveClose, "Ctrl+Enter"),
@@ -185,6 +191,10 @@ pub struct Config {
     pub focus_loss: FocusLoss,
     pub delete_empty_draft: bool,
     pub fsync: bool,
+    /// Opt-in only. Calling CreateSession on the GlobalShortcuts portal crashes
+    /// xdg-desktop-portal on some desktops (KDE Plasma 6 segfaults in
+    /// handle_create_session), so it must never run unasked.
+    pub use_portal: bool,
     pub restore_position: bool,
     pub ui_font: Option<PathBuf>,
     pub heading_font: Option<PathBuf>,
@@ -202,6 +212,7 @@ impl Default for Config {
             focus_loss: FocusLoss::Prompt,
             delete_empty_draft: true,
             fsync: true,
+            use_portal: false,
             restore_position: true,
             ui_font: None,
             heading_font: None,

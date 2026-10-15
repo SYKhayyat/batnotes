@@ -280,6 +280,20 @@ fn keys(ui: &mut egui::Ui, c: &mut Ctx<'_>, out: &mut Vec<Action>) {
             .size(11.0)
             .color(tone),
     );
+    ui.add_space(10.0);
+    // Off by default on purpose: on some desktops the XDG GlobalShortcuts
+    // portal crashes the portal daemon outright. Never enable it implicitly.
+    let mut portal = c.cfg.use_portal;
+    if row_hit(
+        ui,
+        &th,
+        "Use the XDG GlobalShortcuts portal",
+        "Off by default — it crashes the portal daemon on some desktops. Restart to apply.",
+        |ui| toggle(ui, &th, &mut portal).clicked(),
+    ) {
+        out.push(Action::SetUsePortal(portal));
+    }
+
     if !c.hotkey_ok {
         ui.add_space(6.0);
         ui.label(

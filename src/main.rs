@@ -7,6 +7,7 @@ use eframe::egui;
 fn main() -> Result<()> {
     // Fix the loader path before anything touches a windowing library. This may
     // re-exec the process.
+    platform::install_panic_log();
     platform::prepare();
 
     // Single instance. A second `batnotes --show` — which is what the desktop

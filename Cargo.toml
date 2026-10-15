@@ -34,5 +34,8 @@ tempfile = "3"
 opt-level = 3
 lto = "thin"
 codegen-units = 1
-panic = "abort"
-strip = true
+# Deliberately NOT `panic = "abort"` and NOT stripped. A stripped aborting
+# build turns every panic into an anonymous core dump with no message, which is
+# exactly how the first crash went undiagnosed.
+panic = "unwind"
+debug = 1

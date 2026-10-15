@@ -39,6 +39,9 @@ pub fn show(ui: &mut egui::Ui, c: &mut Ctx<'_>, out: &mut Vec<Action>) {
             *c.direction = dir;
             out.push(Action::SetDirection(dir));
         }
+        if kit::ghost(ui, &th, "My notes").on_hover_text("Browse without leaving this draft").clicked() {
+            out.push(Action::ShowLibrary);
+        }
         ui.label(RichText::new("·").size(11.0).color(th.rule));
         ui.label(
             RichText::new(match &c.id {

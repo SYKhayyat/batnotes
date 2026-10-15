@@ -255,10 +255,22 @@ impl Probe {
     }
 }
 
-pub fn start(invoke: HotkeySpec) -> Service {
+pub fn start(invoke: HotkeySpec, use_portal: bool) -> Service {
     let (tx, rx) = mpsc::channel::<()>();
 
-    if let Some(status) = spawn_portal(tx.clone(), &invoke) {
+    // The portal is opt-in and sticky-fail. On KDE Plasma 6 a CreateSession
+    // call segfaults xdg-desktop-portal, taking the desktop's file chooser,
+    // screenshot and global-shortcut plumbing down with it. That is far too
+    // expensive to pay on every launch, so it is never probed implicitly.
+    if use_portal && !portal_marked_unusable() {
+        if let Some(status) = spawn_portal(tx.clone(), &invoke) {
+            log(&status, &invoke);
+            return Service { rx, status };
+        }
+        mark_portal_unusable();
+    }
+
+    if let Some(status) = spawn_x11(tx.clone(), &invoke) {
         log(&status, &invoke);
         return Service { rx, status };
     }
@@ -313,6 +325,35 @@ fn log(status: &Status, invoke: &HotkeySpec) {
 /// implementations open a configuration dialog here and never answer.
 const PORTAL_TIMEOUT: Duration = Duration::from_secs(4);
 
+fn portal_state_dir() -> PathBuf {
+    dirs::state_dir()
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("batnotes")
+}
+
+fn portal_marker() -> PathBuf {
+    portal_state_dir().join("portal-unusable")
+}
+
+/// Has the portal already proven hostile on this machine?
+pub fn portal_marked_unusable() -> bool {
+    portal_marker().exists()
+}
+
+fn mark_portal_unusable() {
+    let path = portal_marker();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(&path, "the GlobalShortcuts portal did not answer; not probing again\n");
+}
+
+/// Clear the marker so the portal can be retried from Settings.
+pub fn forget_portal_failure() {
+    let _ = std::fs::remove_file(portal_marker());
+}
+
 fn spawn_portal(tx: Sender<()>, invoke: &HotkeySpec) -> Option<Status> {
     let trigger = invoke.to_portal_trigger();
 
@@ -330,7 +371,7 @@ fn spawn_portal(tx: Sender<()>, invoke: &HotkeySpec) -> Option<Status> {
     let portal = match rx.recv_timeout(PORTAL_TIMEOUT) {
         Ok(Ok(p)) => p,
         Ok(Err(e)) => {
-            eprintln!("batnotes: portal hotkey unavailable: {e}");
+            eprintln!("batnotes: portal hotkey unavailable: {e} — not probing it again");
             return None;
         }
         Err(mpsc::RecvTimeoutError::Timeout) => {

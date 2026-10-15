@@ -56,6 +56,8 @@ pub struct App {
     ed_dir: Direction,
     ed_original_dir: Direction,
     ed_is_new: bool,
+    /// Where Escape/Cancel should go when the editor closes.
+    ed_return: View,
 
     query: String,
     rows: Vec<Row>,
@@ -74,6 +76,7 @@ pub struct App {
     config_warning: Option<String>,
     storage_error: Option<String>,
 
+    focus_editor: bool,
     opened_at: Option<Instant>,
     open_ms: Option<f32>,
     visible: bool,
@@ -97,7 +100,7 @@ impl App {
 
         let invoke = HotkeySpec::parse(&config.binding(Command::Invoke))
             .unwrap_or_else(|_| HotkeySpec::parse("Meta+Shift+Space").expect("literal"));
-        let hotkey = hotkey::start(invoke.clone());
+        let hotkey = hotkey::start(invoke.clone(), config.use_portal);
 
         let searcher = Searcher::new();
         searcher.rebuild(index.clone());
@@ -123,6 +126,7 @@ impl App {
             ed_dir: Direction::Rtl,
             ed_original_dir: Direction::Rtl,
             ed_is_new: true,
+            ed_return: View::Chooser,
             query: String::new(),
             rows: Vec::new(),
             selected: 0,
@@ -137,6 +141,7 @@ impl App {
             toast: None,
             config_warning: loaded.warning,
             storage_error: None,
+            focus_editor: false,
             opened_at: None,
             open_ms: None,
             visible: false,
@@ -241,8 +246,10 @@ impl App {
         self.ed_original_dir = doc.direction;
         self.ed_id = Some(id.to_string());
         self.ed_is_new = false;
+        self.ed_return = View::Library;
         self.view = View::Editor;
         self.prompt = None;
+        self.focus_editor = true;
     }
 
     fn new_draft(&mut self) {
@@ -252,8 +259,10 @@ impl App {
         self.ed_original_dir = self.ed_dir;
         self.ed_id = None;
         self.ed_is_new = true;
+        self.ed_return = View::Chooser;
         self.view = View::Editor;
         self.prompt = None;
+        self.focus_editor = true;
     }
 
     fn save(&mut self, close: bool) {
@@ -366,6 +375,7 @@ impl App {
                 self.refresh();
                 self.query.clear();
                 self.recompute_rows();
+                self.ed_return = View::Library;
                 self.view = View::Library;
             }
             Action::OpenSettings => {
@@ -377,14 +387,20 @@ impl App {
             Action::OpenNote(id) | Action::ResumeNote(id) => self.open_note(&id),
             Action::Back => match self.view {
                 View::Settings => self.view = self.prev_view,
-                View::Editor | View::Library => {
-                    if self.view == View::Editor && self.dirty() {
+                View::Editor => {
+                    if self.dirty() {
                         self.prompt = Some(ui::PROMPT_CANCEL.into());
                     } else {
-                        self.view = View::Chooser;
+                        let back = self.ed_return;
+                        self.view = back;
                         self.ed_id = None;
                         self.ed_text.clear();
                     }
+                }
+                View::Library => {
+                    self.view = View::Chooser;
+                    self.query.clear();
+                    self.recompute_rows();
                 }
                 View::Chooser => self.hide(ctx),
             },
@@ -393,8 +409,24 @@ impl App {
                 if self.dirty() {
                     self.prompt = Some(ui::PROMPT_CANCEL.into());
                 } else {
-                    self.hide_nohide();
+                    let back = self.ed_return;
+                    self.view = back;
+                    self.ed_id = None;
+                    self.ed_text.clear();
                 }
+            }
+            // Jump from the editor straight to the library, and back again.
+            Action::ShowLibrary => {
+                self.ed_id = None;
+                self.ed_text.clear();
+                if self.ed_original.is_empty() {
+                    self.ed_original = String::new();
+                }
+                self.refresh();
+                self.query.clear();
+                self.recompute_rows();
+                self.ed_return = View::Library;
+                self.view = View::Library;
             }
             Action::Delete(id) | Action::ConfirmDeleteAccepted(id) => self.delete_note(&id),
             Action::ConfirmDelete(id) => self.confirm_delete = Some(id),
@@ -477,6 +509,18 @@ impl App {
                 let _ = std::process::Command::new("xdg-open")
                     .arg(&self.config.notes_dir)
                     .spawn();
+            }
+            Action::SetUsePortal(b) => {
+                self.config.use_portal = b;
+                if !b {
+                    hotkey::forget_portal_failure();
+                }
+                let _ = self.config.save(&self.config_path);
+                self.toast(if b {
+                    "Portal enabled — restart batnotes to try it. It may be unstable on this desktop."
+                } else {
+                    "Portal disabled"
+                });
             }
             Action::ApplyHotkey => match hotkey::install_desktop_shortcut(&self.hotkey_spec) {
                 Ok(()) => self.toast(format!(
@@ -570,6 +614,7 @@ impl App {
             }
             Command::NewNote => Action::NewNote,
             Command::OpenLibrary => Action::OpenLibrary,
+            Command::ShowLibrary if self.view == View::Editor => Action::ShowLibrary,
             Command::Settings => Action::OpenSettings,
             Command::Save => Action::Save { close: false },
             Command::SaveClose => Action::Save { close: true },
@@ -830,6 +875,7 @@ impl App {
             View::Editor => {
                 v.push((Command::Save, "save"));
                 v.push((Command::SaveClose, "save & close"));
+                v.push((Command::ShowLibrary, "notes"));
                 v.push((Command::ToggleDirection, "RTL/LTR"));
             }
             View::Library => {
@@ -958,7 +1004,19 @@ impl eframe::App for App {
             }
         }
 
-        self.paint(ctx);
+        // A panic while painting must not take the daemon down: the whole point
+        // of this app is that it is always there for the next capture. Catch
+        // it, record it, and fall back to a usable view.
+        let painted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.paint(ctx)));
+        if painted.is_err() {
+            self.storage_error = Some(
+                "The last screen could not be drawn — see crash.log. The app is still running.".into(),
+            );
+            self.view = View::Chooser;
+            self.ed_id = None;
+            self.ed_text.clear();
+            self.confirm_delete = None;
+        }
         ctx.request_repaint_after(Duration::from_millis(80));
     }
 

@@ -121,6 +121,46 @@ pub fn prepare() {
     reexec(&[(STAGE, Some(&next)), ("LD_LIBRARY_PATH", Some(&joined))]);
 }
 
+/// Where crash reports are written.
+fn crash_log_path() -> std::path::PathBuf {
+    dirs::state_dir()
+        .or_else(dirs::data_dir)
+        .unwrap_or_else(std::env::temp_dir)
+        .join("batnotes/crash.log")
+}
+
+/// Record every panic to a file as well as stderr.
+///
+/// A daemon is usually launched by the desktop, not from a terminal, so stderr
+/// goes nowhere. Without this a panic is only observable as a core dump.
+pub fn install_panic_log() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let path = crash_log_path();
+        let mut report = String::new();
+        report.push_str(&format!(
+            "\n---- batnotes panic at {} ----\n{info}\n",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        ));
+        report.push_str(&format!("{}\n", std::backtrace::Backtrace::force_capture()));
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            let _ = f.write_all(report.as_bytes());
+        }
+        previous(info);
+    }));
+}
+
 /// Called when the window could not be created. Retries once under XWayland.
 ///
 /// Returns only if there is nothing left to try.

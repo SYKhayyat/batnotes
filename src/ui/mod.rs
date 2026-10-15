@@ -22,6 +22,7 @@ pub enum View {
 pub enum Action {
     NewNote,
     OpenLibrary,
+    ShowLibrary,
     OpenSettings,
     OpenNote(String),
     ResumeNote(String),
@@ -38,6 +39,7 @@ pub enum Action {
     SetPreviewLines(usize),
     SetFocusLoss(crate::config::FocusLoss),
     SetFsync(bool),
+    SetUsePortal(bool),
     SetBinding(Command, String),
     ResetBindings,
     ImportNotes,
