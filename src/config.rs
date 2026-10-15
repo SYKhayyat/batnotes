@@ -196,6 +196,9 @@ pub struct Config {
     /// xdg-desktop-portal on some desktops (KDE Plasma 6 segfaults in
     /// handle_create_session), so it must never run unasked.
     pub use_portal: bool,
+    /// Second global key: opens the note list directly. The invoke key is
+    /// capture-only, so review needs its own entry point.
+    pub notes_hotkey: String,
     pub restore_position: bool,
     pub ui_font: Option<PathBuf>,
     pub heading_font: Option<PathBuf>,
@@ -214,6 +217,7 @@ impl Default for Config {
             delete_empty_draft: true,
             fsync: true,
             use_portal: false,
+            notes_hotkey: "Meta+Shift+L".to_string(),
             restore_position: true,
             ui_font: None,
             heading_font: None,

@@ -255,7 +255,7 @@ impl Probe {
     }
 }
 
-pub fn start(invoke: HotkeySpec, use_portal: bool) -> Service {
+pub fn start(invoke: HotkeySpec, notes: HotkeySpec, use_portal: bool) -> Service {
     let (tx, rx) = mpsc::channel::<()>();
 
     // The portal is opt-in and sticky-fail. On KDE Plasma 6 a CreateSession
@@ -282,7 +282,7 @@ pub fn start(invoke: HotkeySpec, use_portal: bool) -> Service {
     // then check whether it actually took. Writing kglobalshortcutsrc is not
     // the same as the daemon having read it, and claiming otherwise is the bug
     // that started all of this.
-    let status = match install_desktop_shortcut(&invoke) {
+    let status = match install_desktop_shortcut(&invoke, &notes) {
         Ok(()) => {
             let live = kde_component_registered();
             Status {
@@ -711,17 +711,24 @@ fn kde_component_registered() -> bool {
     let Ok(iface) = <zbus_names::InterfaceName>::try_from("org.freedesktop.DBus.Introspectable") else {
         return false;
     };
-    let Ok(proxy) = zbus::blocking::Proxy::new(
-        &conn,
-        "org.kde.kglobalaccel",
-        "/component/batnotes",
-        iface,
-    ) else {
-        return false;
-    };
-    let r: zbus::Result<String> = proxy.call("Introspect", &());
-    r.is_ok()
+    for component in [KDESKTOP_UUID, "b4a7notes000000000000000000000002"] {
+        let path = format!("/component/{component}");
+        let Ok(proxy) = zbus::blocking::Proxy::new(
+            &conn,
+            "org.kde.kglobalaccel",
+            path.as_str(),
+            iface.clone(),
+        ) else {
+            return false;
+        };
+        let r: zbus::Result<String> = proxy.call("Introspect", &());
+        if r.is_err() {
+            return false;
+        }
+    }
+    true
 }
+const KDESKTOP_NAMESPACE: &str = "b4a7notes";
 const KDESKTOP_UUID: &str = "b4a7notes000000000000000000000001";
 
 /// Register `batnotes --show` as a desktop-level global shortcut.
@@ -730,9 +737,10 @@ const KDESKTOP_UUID: &str = "b4a7notes000000000000000000000001";
 /// reads; the shortcut is then owned by the compositor, which is the only
 /// approach guaranteed to receive keys on Wayland regardless of which toolkit
 /// the focused client uses.
-pub fn install_desktop_shortcut(spec: &HotkeySpec) -> Result<()> {
+pub fn install_desktop_shortcut(spec: &HotkeySpec, notes: &HotkeySpec) -> Result<()> {
     let exe = std::env::current_exe()?;
-    let exec = format!("{} --show", exe.display());
+    let capture = format!("{} --show", exe.display());
+    let library = format!("{} --show-notes", exe.display());
 
     let apps = dirs::data_dir()
         .ok_or_else(|| anyhow!("no XDG data dir"))?
@@ -741,7 +749,7 @@ pub fn install_desktop_shortcut(spec: &HotkeySpec) -> Result<()> {
     std::fs::write(
         apps.join(DESKTOP_FILE),
         format!(
-            "[Desktop Entry]\nType=Application\nName=Batnotes\nComment=Show the batnotes overlay\nExec={exec}\nIcon=accessories-text-editor\nTerminal=false\nNoDisplay=true\nStartupNotify=false\nX-GNOME-Autostart-enabled=true\n"
+            "[Desktop Entry]\nType=Application\nName=Batnotes\nComment=Capture a note\nExec={capture}\nIcon=accessories-text-editor\nTerminal=false\nNoDisplay=true\nStartupNotify=false\nX-GNOME-Autostart-enabled=true\n"
         ),
     )?;
 
@@ -757,15 +765,18 @@ pub fn install_desktop_shortcut(spec: &HotkeySpec) -> Result<()> {
         ),
     )?;
 
-    install_kde_shortcut(spec, &exec)?;
+    install_kde_shortcut(spec, notes)?;
     Ok(())
 }
 
-fn install_kde_shortcut(spec: &HotkeySpec, exec: &str) -> Result<()> {
+fn install_kde_shortcut(spec: &HotkeySpec, notes: &HotkeySpec) -> Result<()> {
     let path = dirs::config_dir()
         .ok_or_else(|| anyhow!("no XDG config dir"))?
         .join("kglobalshortcutsrc");
     let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let exe = std::env::current_exe()?;
+    let capture = format!("{} --show", exe.display());
+    let library = format!("{} --show-notes", exe.display());
 
     // Drop any previous batnotes service blocks so remapping is idempotent.
     let mut out: Vec<String> = Vec::new();
@@ -773,7 +784,10 @@ fn install_kde_shortcut(spec: &HotkeySpec, exec: &str) -> Result<()> {
     for line in existing.lines() {
         let t = line.trim_start();
         if t.starts_with('[') {
-            skipping = line.contains(DESKTOP_FILE) || line.contains(KDESKTOP_UUID);
+            // Match on the namespace, not one UUID: a newer binary adds
+            // components, and an old one must not leave them behind to
+            // shadow the new bindings.
+            skipping = line.contains(DESKTOP_FILE) || line.contains(KDESKTOP_NAMESPACE);
         }
         if !skipping {
             out.push(line.to_string());
@@ -783,15 +797,28 @@ fn install_kde_shortcut(spec: &HotkeySpec, exec: &str) -> Result<()> {
         out.pop();
     }
 
-    out.push(format!("[services][{}]", KDESKTOP_UUID));
-    out.push(format!("Name=Batnotes overlay"));
-    out.push(format!("Exec={exec}"));
-    out.push(format!("_launch={}", spec.to_kde_accelerator()));
-    out.push(String::new());
-    out.push(format!("[services][{}]", DESKTOP_FILE));
-    out.push(format!("Name=Batnotes overlay"));
-    out.push(format!("Exec={exec}"));
-    out.push(format!("_launch={}", spec.to_kde_accelerator()));
+    // Two shortcuts: capture and review. The whole design assumes you can get
+    // straight to a blank note, and straight to the list, without navigating.
+    for (uuid, name, accel, cmd) in [
+        (
+            KDESKTOP_UUID,
+            "Batnotes capture",
+            spec.to_kde_accelerator(),
+            capture.as_str(),
+        ),
+        (
+            "b4a7notes000000000000000000000002",
+            "Batnotes notes",
+            notes.to_kde_accelerator(),
+            library.as_str(),
+        ),
+    ] {
+        out.push(format!("[services][{uuid}]"));
+        out.push(format!("Name={name}"));
+        out.push(format!("Exec={cmd}"));
+        out.push(format!("_launch={accel}"));
+        out.push(String::new());
+    }
 
     std::fs::write(&path, out.join("\n"))?;
     Ok(())
@@ -804,13 +831,21 @@ pub fn socket_path() -> PathBuf {
         .join("batnotes.sock")
 }
 
-/// Ask an already-running instance to show its overlay. Returns true if one was
-/// listening.
-pub fn signal_running_instance() -> bool {
+/// Is another instance listening? This must have no side effects — probing by
+/// writing "show" makes the overlay toggle open and straight back shut.
+pub fn instance_running() -> bool {
+    std::os::unix::net::UnixStream::connect(&socket_path()).is_ok()
+}
+
+/// Ask an already-running instance to show its overlay.
+pub fn send_show_request(kind: ShowRequest) -> bool {
     use std::io::Write;
-    let path = socket_path();
-    match std::os::unix::net::UnixStream::connect(&path) {
-        Ok(mut s) => s.write_all(b"show\n").is_ok(),
+    let payload = match kind {
+        ShowRequest::Toggle => b"show\n".as_slice(),
+        ShowRequest::Library => b"library\n".as_slice(),
+    };
+    match std::os::unix::net::UnixStream::connect(&socket_path()) {
+        Ok(mut s) => s.write_all(payload).is_ok(),
         Err(_) => false,
     }
 }
@@ -823,10 +858,19 @@ pub fn serve_single_instance() -> Result<Option<std::os::unix::net::UnixListener
     }
     // A socket left behind by a crashed run would block the bind; remove it
     // only if nobody is actually answering.
-    if std::fs::metadata(&path).is_ok() && !signal_running_instance() {
+    if std::fs::metadata(&path).is_ok() && !instance_running() {
         let _ = std::fs::remove_file(&path);
     }
-    if signal_running_instance() {
+    if instance_running() {
+        // Only signal once, and only because we are genuinely the second
+        // instance. `--show-notes` goes straight to the list; `--show` is the
+        // capture key.
+        let kind = if std::env::args().any(|a| a == "--show-notes") {
+            ShowRequest::Library
+        } else {
+            ShowRequest::Toggle
+        };
+        send_show_request(kind);
         return Ok(None);
     }
     let listener = UnixListener::bind(&path)?;
@@ -841,22 +885,36 @@ pub fn publish_listener(l: std::os::unix::net::UnixListener) {
     let _ = LISTENER.set(Mutex::new(l));
 }
 
+/// What a second instance is asking the daemon to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShowRequest {
+    /// Capture: open a blank note, or close if already open.
+    Toggle,
+    /// Review: open the note list.
+    Library,
+}
+
 /// True when another process asked the overlay to appear. Called once per
 /// frame, so it must not block.
-pub fn take_show_request() -> bool {
+pub fn take_show_request() -> Option<ShowRequest> {
     use std::io::Read;
-    let Some(cell) = LISTENER.get() else { return false };
-    let Ok(l) = cell.lock() else { return false };
+    let Some(cell) = LISTENER.get() else { return None };
+    let Ok(l) = cell.lock() else { return None };
     loop {
         match l.accept() {
             Ok((mut stream, _)) => {
                 let mut buf = [0u8; 16];
-                let _ = stream.read(&mut buf);
-                if String::from_utf8_lossy(&buf).trim() == "show" {
-                    return true;
+                // Compare only what was actually read. The tail of the buffer
+                // stays NUL, and `trim` does not remove NULs, so comparing the
+                // whole array silently never matches.
+                let n = stream.read(&mut buf).unwrap_or(0);
+                match String::from_utf8_lossy(&buf[..n]).trim() {
+                    "show" => return Some(ShowRequest::Toggle),
+                    "library" => return Some(ShowRequest::Library),
+                    _ => {}
                 }
             }
-            Err(_) => return false,
+            Err(_) => return None,
         }
     }
 }

@@ -51,7 +51,17 @@ fn main() -> Result<()> {
         ui.clone().tick();
         glib::ControlFlow::Continue
     });
+    if std::env::var_os("BATNOTES_DEBUG_UI").is_some() {
+        eprintln!("batnotes: glib main loop running, tick scheduled");
+    }
 
-    glib::MainLoop::new(None, false).run();
-    Ok(())
+    // Pump the *default* main context, because that is where
+    // `timeout_add_local` and GTK's own sources are registered. Running a
+    // separate `MainLoop` leaves the default context untouched, so no timeout
+    // ever fires and the overlay is never shown.
+    let ctx = glib::MainContext::default();
+    loop {
+        ctx.iteration(false);
+        std::thread::sleep(Duration::from_millis(8));
+    }
 }

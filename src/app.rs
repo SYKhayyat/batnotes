@@ -4,6 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// How long typing must pause before the note is written to disk.
+const AUTOSAVE_DELAY: Duration = Duration::from_millis(700);
+
 use crate::config::{Command, Config, FocusLoss};
 use crate::hotkey::{self, HotkeySpec};
 use crate::model::{self, Direction, Note};
@@ -55,6 +58,11 @@ pub struct App {
     pub config_warning: Option<String>,
     pub storage_error: Option<String>,
 
+    /// When the text last changed, for autosave debouncing.
+    pub last_edit: Option<Instant>,
+    /// True once the user has typed in the current capture, so autosave does
+    /// not write empty notes.
+    pub touched: bool,
     pub visible: bool,
     /// Set by the GUI layer when Escape/close was requested.
     pub closing: bool,
@@ -71,7 +79,9 @@ impl App {
 
         let invoke = HotkeySpec::parse(&config.binding(Command::Invoke))
             .unwrap_or_else(|_| HotkeySpec::parse("Meta+Shift+Space").expect("literal"));
-        let hotkey = hotkey::start(invoke.clone(), config.use_portal);
+        let notes_hotkey = HotkeySpec::parse(&config.notes_hotkey)
+            .unwrap_or_else(|_| HotkeySpec::parse("Meta+Shift+L").expect("literal"));
+        let hotkey = hotkey::start(invoke.clone(), notes_hotkey, config.use_portal);
 
         let searcher = Searcher::new();
         searcher.rebuild(index.clone());
@@ -88,15 +98,15 @@ impl App {
             index,
             order,
             searcher,
-            view: View::Chooser,
-            prev_view: View::Chooser,
+            view: View::Editor,
+            prev_view: View::Editor,
             ed_id: None,
             ed_text: String::new(),
             ed_original: String::new(),
             ed_dir: Direction::Rtl,
             ed_original_dir: Direction::Rtl,
             ed_is_new: true,
-            ed_return: View::Chooser,
+            ed_return: View::Library,
             query: String::new(),
             rows: Vec::new(),
             selected: 0,
@@ -109,6 +119,8 @@ impl App {
             toast: None,
             config_warning: loaded.warning,
             storage_error: None,
+            last_edit: None,
+            touched: false,
             visible: false,
             closing: false,
         })
@@ -197,14 +209,25 @@ impl App {
 
     // ---- visibility --------------------------------------------------
 
+    /// Invoke goes straight into an empty editor.
+    ///
+    /// There is deliberately no chooser on the hot path. Asking "new note or
+    /// my notes?" before you have written anything is itself the context shift
+    /// this app exists to avoid — you press the key, you type, you are gone.
     pub fn show(&mut self) {
         self.visible = true;
         self.closing = false;
+        self.new_draft();
     }
 
+    /// Close the overlay. Anything typed is saved first: the whole premise is
+    /// that a captured thought survives, so hiding is a save.
     pub fn hide(&mut self) {
+        if self.view == View::Editor && self.has_content() && self.dirty() {
+            self.save_quiet(true);
+        }
         self.visible = false;
-        self.view = View::Chooser;
+        self.view = View::Editor;
         self.ed_id = None;
         self.ed_text.clear();
         self.ed_original.clear();
@@ -212,9 +235,13 @@ impl App {
         self.confirm_delete = None;
         self.recording = None;
         self.query.clear();
+        self.touched = false;
+        self.last_edit = None;
         self.recompute_rows();
     }
 
+    /// The invoke key always means "capture". Pressing it again closes the
+    /// overlay, which is the same muscle memory as any quick-capture tool.
     pub fn toggle(&mut self) {
         if self.visible {
             self.hide();
@@ -223,10 +250,32 @@ impl App {
         }
     }
 
+    /// Second global entry point: go straight to the list, skipping capture.
+    pub fn show_library(&mut self) {
+        self.visible = true;
+        self.closing = false;
+        self.dispatch(Action::OpenLibrary);
+    }
+
     /// Called every frame by the GUI layer.
     pub fn pump(&mut self) {
-        while self.hotkey.rx.try_recv().is_ok() || hotkey::take_show_request() {
+        let mut toggle = false;
+        let mut library = false;
+        while self.hotkey.rx.try_recv().is_ok() {
+            toggle = true;
+        }
+        match hotkey::take_show_request() {
+            Some(hotkey::ShowRequest::Toggle) => toggle = true,
+            Some(hotkey::ShowRequest::Library) => library = true,
+            None => {}
+        }
+        if library {
+            self.show_library();
+        } else if toggle {
             self.toggle();
+        }
+        if self.autosave() {
+            return;
         }
         if let Some(hits) = self.searcher.poll() {
             self.apply_hits(hits);
@@ -236,6 +285,35 @@ impl App {
                 self.toast = None;
             }
         }
+    }
+
+    /// Called by the GUI whenever the buffer changes.
+    pub fn note_edited(&mut self) {
+        self.last_edit = Some(Instant::now());
+        self.touched = true;
+    }
+
+    /// Is there anything worth writing to disk?
+    pub fn has_content(&self) -> bool {
+        !self.ed_text.trim().is_empty()
+    }
+
+    /// Autosave after a pause in typing.
+    ///
+    /// A quick capture must never depend on the user remembering to save.
+    /// Nothing is written for an empty buffer, so no junk files appear.
+    pub fn autosave(&mut self) -> bool {
+        if self.view != View::Editor || !self.has_content() || !self.dirty() {
+            return false;
+        }
+        let Some(at) = self.last_edit else { return false };
+        if at.elapsed() < AUTOSAVE_DELAY {
+            return false;
+        }
+        // `save` assigns `ed_id` from the note it just wrote, so subsequent
+        // autosaves keep updating the same file rather than spawning new ones.
+        self.save_quiet(false);
+        true
     }
 
     pub fn toast(&mut self, m: impl Into<String>) {
@@ -276,6 +354,8 @@ impl App {
         self.ed_return = View::Library;
         self.view = View::Editor;
         self.prompt = None;
+        self.touched = false;
+        self.last_edit = None;
     }
 
     pub fn new_draft(&mut self) {
@@ -285,9 +365,19 @@ impl App {
         self.ed_original_dir = self.ed_dir;
         self.ed_id = None;
         self.ed_is_new = true;
-        self.ed_return = View::Chooser;
+        self.ed_return = View::Library;
         self.view = View::Editor;
         self.prompt = None;
+        self.touched = false;
+        self.last_edit = None;
+    }
+
+    /// Save without any feedback. Used by autosave and by closing the overlay,
+    /// where a confirmation toast is pure noise.
+    pub fn save_quiet(&mut self, close: bool) {
+        let saved_toast = self.toast.take();
+        self.save(close);
+        self.toast = saved_toast;
     }
 
     pub fn save(&mut self, close: bool) {
@@ -297,8 +387,7 @@ impl App {
                 if close {
                     self.hide();
                 } else {
-                    self.view = View::Chooser;
-                    self.ed_id = None;
+                    self.hide();
                 }
             } else {
                 self.toast("Write something first, or cancel to discard");
@@ -307,10 +396,11 @@ impl App {
         }
 
         let result = match self.ed_id.clone() {
-            Some(id) => self
-                .storage
-                .save(&id, &self.ed_text, self.ed_dir)
-                .and_then(|n| self.storage.rename_to_match_content(&n, &self.ed_text)),
+            // Filenames stay stable. Renaming a note as its first line is
+            // typed produces a burst of junk files during exactly the flow
+            // this app is built for, and the title is derived from content
+            // for display anyway.
+            Some(id) => self.storage.save(&id, &self.ed_text, self.ed_dir),
             None => {
                 let id = model::new_id();
                 self.storage.save(&id, &self.ed_text, self.ed_dir)
@@ -335,15 +425,6 @@ impl App {
             }
             Err(e) => self.storage_error = Some(format!("Could not save: {e}")),
         }
-    }
-
-    fn leave_editor(&mut self) {
-        let back = self.ed_return;
-        self.view = back;
-        self.ed_id = None;
-        self.ed_text.clear();
-        self.ed_original.clear();
-        self.ed_original_dir = self.ed_dir;
     }
 
     pub fn delete_note(&mut self, id: &str) {
@@ -428,30 +509,26 @@ impl App {
                 self.recording = None;
                 self.view = View::Settings;
             }
-            Action::OpenNote(id) | Action::ResumeNote(id) => self.open_note(&id),
+            Action::OpenNote(id) => self.open_note(&id),
+            // Back closes the overlay rather than navigating a menu. There is
+            // no menu: Back is "I'm done here".
             Action::Back => match self.view {
                 View::Settings => self.view = self.prev_view,
                 View::Editor => {
                     if self.dirty() {
                         self.prompt = Some(ui::PROMPT_CANCEL.into());
                     } else {
-                        self.leave_editor();
+                        self.hide();
                     }
                 }
-                View::Library => {
-                    self.view = View::Chooser;
-                    self.query.clear();
-                    self.last_query.clear();
-                    self.recompute_rows();
-                }
-                View::Chooser => self.hide(),
+                _ => self.hide(),
             },
             Action::Save { close } => self.save(close),
             Action::Cancel => {
                 if self.dirty() {
                     self.prompt = Some(ui::PROMPT_CANCEL.into());
                 } else {
-                    self.leave_editor();
+                    self.hide();
                 }
             }
             Action::Delete(id) | Action::ConfirmDeleteAccepted(id) => self.delete_note(&id),
@@ -551,12 +628,19 @@ impl App {
                     .arg(&self.config.notes_dir)
                     .spawn();
             }
-            Action::ApplyHotkey => match hotkey::install_desktop_shortcut(&self.hotkey_spec) {
-                Ok(()) => self.toast(format!(
-                    "Desktop shortcut written · {}",
-                    self.hotkey_spec.to_kde_accelerator()
-                )),
-                Err(e) => self.storage_error = Some(format!("Could not install shortcut: {e}")),
+            Action::ApplyHotkey => {
+                let notes = HotkeySpec::parse(&self.config.notes_hotkey)
+                    .unwrap_or_else(|_| HotkeySpec::parse("Meta+Shift+L").expect("literal"));
+                match hotkey::install_desktop_shortcut(&self.hotkey_spec, &notes) {
+                    Ok(()) => self.toast(format!(
+                        "Shortcuts written · {} capture, {} notes",
+                        self.hotkey_spec.to_kde_accelerator(),
+                        notes.to_kde_accelerator()
+                    )),
+                    Err(e) => {
+                        self.storage_error = Some(format!("Could not install shortcut: {e}"))
+                    }
+                }
             },
             Action::Close => self.hide(),
         }
@@ -594,10 +678,6 @@ impl App {
     pub fn hints(&self) -> Vec<(Command, &'static str)> {
         let mut v: Vec<(Command, &'static str)> = vec![];
         match self.view {
-            View::Chooser => {
-                v.push((Command::NewNote, "new"));
-                v.push((Command::OpenLibrary, "notes"));
-            }
             View::Editor => {
                 v.push((Command::Save, "save"));
                 v.push((Command::SaveClose, "save & close"));
@@ -611,10 +691,7 @@ impl App {
             View::Settings => {}
         }
         v.push((Command::Settings, "settings"));
-        v.push((
-            Command::Back,
-            if self.view == View::Chooser { "close" } else { "back" },
-        ));
+        v.push((Command::Back, "close"));
         v
     }
 }
@@ -645,15 +722,15 @@ mod tests {
             index,
             order,
             searcher: Searcher::new(),
-            view: View::Chooser,
-            prev_view: View::Chooser,
+            view: View::Editor,
+            prev_view: View::Editor,
             ed_id: None,
             ed_text: String::new(),
             ed_original: String::new(),
             ed_dir: Direction::Rtl,
             ed_original_dir: Direction::Rtl,
             ed_is_new: true,
-            ed_return: View::Chooser,
+            ed_return: View::Library,
             query: String::new(),
             rows: Vec::new(),
             selected: 0,
@@ -666,6 +743,8 @@ mod tests {
             toast: None,
             config_warning: None,
             storage_error: None,
+            last_edit: None,
+            touched: false,
             visible: false,
             closing: false,
         }
@@ -729,17 +808,20 @@ mod tests {
     }
 
     #[test]
-    fn back_from_editor_returns_to_library() {
+    fn back_closes_the_overlay_rather_than_navigating_a_menu() {
         let d = tempfile::tempdir().unwrap();
         let mut a = test_app(d.path());
-        a.new_draft();
-        a.ed_text = "x".into();
-        a.save(false);
+        a.show();
+        a.ed_text = "something".into();
+        a.note_edited();
+        a.hide();
+        a.show();
         a.dispatch(Action::OpenLibrary);
         a.open_selected();
         assert_eq!(a.view, View::Editor);
+        a.visible = true;
         a.dispatch(Action::Back);
-        assert_eq!(a.view, View::Library, "Back must return to the library, not the chooser");
+        assert!(!a.visible, "Back means 'I am done here'");
     }
 
     #[test]
@@ -771,9 +853,105 @@ mod tests {
     }
 
     #[test]
+    fn invoke_lands_the_caret_in_an_empty_note() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.show();
+        assert_eq!(a.view, View::Editor, "capture must not route through a menu");
+        assert!(a.ed_id.is_none());
+        assert!(a.ed_text.is_empty());
+    }
+
+    #[test]
+    fn closing_saves_the_capture_rather_than_dropping_it() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.show();
+        a.ed_text = "a passing thought".into();
+        a.note_edited();
+        a.hide();
+        assert_eq!(a.order.len(), 1, "closing must not discard a capture");
+        let id = a.order[0].clone();
+        assert_eq!(
+            a.storage.read_note(&a.index.get(&id).unwrap().path).unwrap(),
+            "a passing thought"
+        );
+    }
+
+    #[test]
+    fn autosave_writes_after_a_pause_without_a_keypress() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.show();
+        a.ed_text = "no key pressed".into();
+        a.note_edited();
+        assert!(!a.autosave(), "must wait for the debounce");
+        a.last_edit = Some(Instant::now() - Duration::from_secs(2));
+        assert!(a.autosave());
+        assert_eq!(a.order.len(), 1);
+    }
+
+    #[test]
+    fn autosave_ignores_an_untouched_buffer() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.show();
+        a.last_edit = Some(Instant::now() - Duration::from_secs(5));
+        assert!(!a.autosave());
+        assert!(a.order.is_empty(), "no note may be written for an empty buffer");
+    }
+
+    #[test]
+    fn autosave_keeps_writing_to_the_same_note() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.show();
+        a.ed_text = "one".into();
+        a.note_edited();
+        a.last_edit = Some(Instant::now() - Duration::from_secs(2));
+        a.autosave();
+        let first = a.order[0].clone();
+
+        a.ed_text = "one two".into();
+        a.note_edited();
+        a.last_edit = Some(Instant::now() - Duration::from_secs(2));
+        a.autosave();
+
+        assert_eq!(a.order.len(), 1, "autosave must not create a note per pause");
+        assert_eq!(a.order[0], first);
+        // The file is renamed as the first line changes, so assert on whatever
+        // single .txt exists rather than on a remembered path.
+        let files: Vec<_> = std::fs::read_dir(d.path().join("notes"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("txt"))
+            .collect();
+        assert_eq!(files.len(), 1, "one note file, no churn");
+        assert_eq!(std::fs::read_to_string(&files[0]).unwrap(), "one two");
+    }
+
+    #[test]
+    fn every_invoke_starts_a_fresh_draft() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.show();
+        a.ed_text = "first thought".into();
+        a.note_edited();
+        a.hide();
+        a.show();
+        assert!(a.ed_text.is_empty(), "each invoke is a new note");
+        assert!(a.ed_id.is_none(), "a new invoke is not editing the last note");
+        assert_eq!(a.order.len(), 1, "the first thought was still captured");
+    }
+
+    #[test]
     fn hints_are_live_for_the_current_view() {
         let d = tempfile::tempdir().unwrap();
-        let a = test_app(d.path());
-        assert!(a.hints().iter().any(|(c, _)| *c == Command::NewNote));
+        let mut a = test_app(d.path());
+        a.show();
+        assert!(a.hints().iter().any(|(c, _)| *c == Command::Save));
+        a.dispatch(Action::OpenLibrary);
+        assert!(a.hints().iter().any(|(c, _)| *c == Command::MoveUp));
     }
 }

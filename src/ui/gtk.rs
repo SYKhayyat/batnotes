@@ -31,6 +31,8 @@ pub struct Ui {
     /// Fingerprint of the state the current tree was built from, so the tree is
     /// only rebuilt when something visible has changed.
     rendered: RefCell<String>,
+    /// View the current tree was built for, so resizing happens on change.
+    current_view: RefCell<View>,
 }
 
 /// `window` is moved in and kept: GTK must not collect the only reference to
@@ -43,6 +45,7 @@ pub fn build(app: App, window: gtk4::Window) -> Rc<Ui> {
         toast: gtk4::Label::new(None),
         last_toast: RefCell::new(None),
         rendered: RefCell::new(String::new()),
+        current_view: RefCell::new(View::Editor),
     });
     let rc2 = rc.clone();
     rc2.init();
@@ -88,6 +91,17 @@ impl Ui {
     }
 
     // ---- window control -------------------------------------------------
+
+    /// Capture wants a small surface; reviewing needs room for a list. One
+    /// large window for both means a jot takes more of the screen than a jot
+    /// should, which is itself a distraction.
+    fn apply_size(&self, view: View) {
+        let (w, h) = match view {
+            View::Editor => (560, 240),
+            View::Library | View::Settings => (660, 560),
+        };
+        self.window.set_default_size(w, h);
+    }
 
     pub fn show(&self) {
         self.window.present();
@@ -156,16 +170,41 @@ impl Ui {
             self.root.remove(&c);
         }
         let app = self.app.borrow();
+        let confirm_id = app.confirm_delete.clone();
+        // Capture stays bare. The list and settings can afford a key legend.
+        let show_hints = matches!(app.view, View::Library | View::Settings);
+        if *self.current_view.borrow() != app.view {
+            *self.current_view.borrow_mut() = app.view;
+            self.apply_size(app.view);
+        }
         match app.view {
-            View::Chooser => self.build_chooser(&app),
             View::Editor => self.build_editor(&app),
             View::Library => self.build_library(&app),
             View::Settings => self.build_settings(&app),
         }
+        if let Some(p) = app.prompt.clone() {
+            let ui = self.clone();
+            self.root.append(&ui.prompt_bar(p));
+        }
         drop(app);
-        self.root.append(&self.clone().hints_bar());
+
+        // Push the hint bar down instead of leaving dead space under a short view.
+        let spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        spacer.set_vexpand(true);
+        self.root.append(&spacer);
+
+        if show_hints {
+            self.root.append(&self.clone().hints_bar());
+        }
         if self.last_toast.borrow().is_some() {
             self.root.append(&self.toast.clone());
+        }
+        // Delete is irreversible, so it is confirmed. Drawn inside this window:
+        // a separate window can land behind the overlay and, with no
+        // always-on-top, the user would never see it.
+        if let Some(id) = confirm_id {
+            let ui = self.clone();
+            self.root.append(&ui.delete_overlay(id));
         }
     }
 
@@ -176,9 +215,24 @@ impl Ui {
 
     // ---- actions ---------------------------------------------------------
 
+    /// Apply an action and redraw.
+    ///
+    /// GTK calls signal handlers across an `extern "C"` boundary, so a panic
+    /// here cannot unwind — it aborts the process. This guard turns a widget bug
+    /// into a message instead of a dead daemon.
     fn dispatch(self: Rc<Self>, a: Action) {
-        self.app.borrow_mut().dispatch(a);
-        self.clone().render_all();
+        let this = self.clone();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            this.app.borrow_mut().dispatch(a);
+            this.clone().render_all();
+        }));
+        if outcome.is_err() {
+            eprintln!("batnotes: a widget handler panicked; recovered");
+            if let Some(w) = self.window.child() {
+                self.window.set_child(None::<&gtk4::Widget>);
+                drop(w);
+            }
+        }
     }
 
     // ---- chrome ----------------------------------------------------------
@@ -233,129 +287,25 @@ impl Ui {
 
     // ---- chooser ---------------------------------------------------------
 
-    fn build_chooser(self: &Rc<Self>, app: &App) {
-        let col = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        col.append(&self.clone().header(if app.order.is_empty() {
-            "new note or browse".to_string()
-        } else {
-            format!("{} notes", app.order.len())
-        }));
-        col.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-        col.append(&self.clone().choice_row(app, "＋", "New note", Command::NewNote, Action::NewNote, None));
-        col.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
-        let count = if app.order.is_empty() {
-            None
-        } else {
-            Some(app.order.len().to_string())
-        };
-        col.append(&self.clone().choice_row(
-            app,
-            "≡",
-            "My notes",
-            Command::OpenLibrary,
-            Action::OpenLibrary,
-            count,
-        ));
-        col.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-        // Resume: the most recent note, one click away.
-        if let Some(id) = app.index.ids().first().cloned() {
-            if let Some(doc) = app.index.get(&id) {
-                let b = gtk4::Button::new();
-                b.add_css_class("resume");
-                let inner = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-                let t = gtk4::Label::new(Some(doc.title.as_str()));
-                t.add_css_class("resume-title");
-                t.set_xalign(0.0);
-                t.set_hexpand(true);
-                t.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-                inner.append(&t);
-                let hint = gtk4::Label::new(Some("resume"));
-                hint.add_css_class("subtitle");
-                inner.append(&hint);
-                b.set_child(Some(&inner));
-                b.connect_clicked({
-                    let ui = self.clone();
-                    move |_| ui.clone().dispatch(Action::ResumeNote(id.clone()))
-                });
-                col.append(&b);
-            }
-        }
 
-        if let Some(w) = &app.config_warning {
-            col.append(&self.clone().banner(w, gtk4::Orientation::Horizontal));
-        }
-        if let Some(p) = &app.prompt {
-            col.append(&self.clone().prompt_bar(p.clone()));
-        }
-        if !app.conflicts.is_empty() {
-            let l = gtk4::Label::new(Some(&format!(
-                "{} bindings conflict — check Settings",
-                app.conflicts.len()
-            )));
-            l.add_css_class("warn");
-            col.append(&l);
-        }
-        self.root.append(&col);
-    }
 
-    fn choice_row(self: Rc<Self>,
-        app: &App,
-        glyph: &str,
-        title: &str,
-        cmd: Command,
-        action: Action,
-        count: Option<String>,
-    ) -> gtk4::Button {
-        let b = gtk4::Button::new();
-        b.add_css_class("choice");
-        let inner = gtk4::Box::new(gtk4::Orientation::Horizontal, 14);
+    // ---- editor ------------------------------------------------------------
 
-        let icon = gtk4::Label::new(Some(glyph));
-        icon.add_css_class("choice-icon");
-        inner.append(&icon);
-
-        let t = gtk4::Label::new(Some(title));
-        t.add_css_class("choice-title");
-        t.set_xalign(0.0);
-        t.set_hexpand(true);
-        inner.append(&t);
-
-        if let Some(c) = count {
-            let n = gtk4::Label::new(Some(&c));
-            n.add_css_class("choice-count");
-            inner.append(&n);
-        }
-        inner.append(&keycap(&app.config.binding(cmd)));
-
-        b.set_child(Some(&inner));
-        b.connect_clicked(move |_| self.clone().dispatch(action.clone()));
-        b
-    }
-
-    fn banner(self: Rc<Self>, text: &str, dir: gtk4::Orientation) -> gtk4::Box {
-        let bar = gtk4::Box::new(dir, 8);
-        bar.add_css_class("banner");
-        let l = gtk4::Label::new(Some(text));
-        l.set_wrap(true);
-        l.set_xalign(0.0);
-        l.set_hexpand(true);
-        bar.append(&l);
-        bar
-    }
-
+    /// Unsaved-changes guard. Non-modal by design: it must not read as an
+    /// error, because the user is mid-thought.
     fn prompt_bar(self: Rc<Self>, which: String) -> gtk4::Box {
-        let (text, save_label, tone) = match which.as_str() {
+        let (text, save_label) = match which.as_str() {
             ui::PROMPT_FOCUS => (
                 "Unsaved changes — the overlay stays open so you don't lose capture.",
                 "Save & close",
-                "banner-warn",
             ),
-            _ => ("Discard these changes?", "Save instead", "banner-danger"),
+            _ => ("Discard these changes?", "Save instead"),
         };
         let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        bar.add_css_class(tone);
+        bar.add_css_class("banner-warn");
+
         let l = gtk4::Label::new(Some(text));
         l.set_wrap(true);
         l.set_xalign(0.0);
@@ -378,7 +328,7 @@ impl Ui {
         });
         bar.append(&discard);
 
-        let stay = gtk4::Button::with_label("Stay");
+        let stay = gtk4::Button::with_label("Keep writing");
         stay.add_css_class("ghost");
         stay.connect_clicked({
             let ui = self.clone();
@@ -388,60 +338,97 @@ impl Ui {
         bar
     }
 
-    // ---- editor ------------------------------------------------------------
+    /// Delete confirmation, drawn over the current view inside the overlay.
+    /// A separate window can land behind the overlay and, with no
+    /// always-on-top, would never be seen.
+    fn delete_overlay(self: Rc<Self>, id: String) -> gtk4::Box {
+        let title = self
+            .app
+            .borrow()
+            .index
+            .get(&id)
+            .map(|d| d.title.as_str())
+            .unwrap_or("this note")
+            .to_string();
 
-    fn build_editor(self: &Rc<Self>, app: &App) {
-        let col = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-        col.append(&self.clone().header(if app.ed_is_new {
-            "new note".to_string()
-        } else {
-            format!("{}.txt", app.ed_id.clone().unwrap_or_default())
-        }));
+        let layer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        layer.set_vexpand(true);
+        layer.add_css_class("scrim");
 
-        let toolbar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let panel = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+        panel.add_css_class("confirm-panel");
+        panel.set_halign(gtk4::Align::Center);
+        panel.set_valign(gtk4::Align::Center);
 
-        // Direction: a real Pango attribute, not a mirror.
-        let seg = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        seg.add_css_class("segmented");
-        for (d, label) in [(Direction::Ltr, "LTR"), (Direction::Rtl, "RTL")] {
-            let b = gtk4::ToggleButton::with_label(label);
-            b.set_active(app.ed_dir == d);
-            if app.ed_dir == d {
-                b.add_css_class("on");
-            }
-            b.connect_clicked({
-                let ui = self.clone();
-                move |_| ui.clone().dispatch(Action::SetDirection(d))
-            });
-            seg.append(&b);
-        }
-        toolbar.append(&seg);
+        let heading = gtk4::Label::new(Some("Delete this note?"));
+        heading.add_css_class("dialog-title");
+        heading.set_xalign(0.0);
+        panel.append(&heading);
 
-        let notes = gtk4::Button::with_label("My notes");
-        notes.add_css_class("ghost");
-        notes.set_tooltip_text(Some("Browse without leaving this draft"));
-        notes.connect_clicked({
+        let body = gtk4::Label::new(Some(&format!(
+            "\u{201c}{title}\u{201d} will be removed from disk. This cannot be undone."
+        )));
+        body.add_css_class("subtitle");
+        body.set_wrap(true);
+        body.set_xalign(0.0);
+        panel.append(&body);
+
+        let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk4::Align::End);
+
+        let keep = gtk4::Button::with_label("Keep it");
+        keep.add_css_class("ghost");
+        keep.connect_clicked({
             let ui = self.clone();
-            move |_| ui.clone().dispatch(Action::ShowLibrary)
+            move |_| ui.clone().dispatch(Action::DismissConfirm)
         });
-        toolbar.append(&notes);
+        buttons.append(&keep);
 
-        let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        toolbar.append(&spacer);
+        let del = gtk4::Button::with_label("Delete file");
+        del.add_css_class("danger");
+        del.connect_clicked({
+            let ui = self.clone();
+            let target = id.clone();
+            move |_| ui.clone().dispatch(Action::ConfirmDeleteAccepted(target.clone()))
+        });
+        buttons.append(&del);
 
-        let status = gtk4::Label::new(Some(if app.dirty() {
-            "Unsaved changes"
-        } else if app.ed_is_new {
-            "Ready to write"
+        panel.append(&buttons);
+        layer.append(&panel);
+        layer
+    }
+
+    /// Capture. The default surface and deliberately almost empty: the text,
+    /// one quiet line of status, and nothing that asks for a decision. Every
+    /// control here is something the user has to *not* think about while
+    /// trying to hold onto a thought.
+    fn build_editor(self: &Rc<Self>, app: &App) {
+        let col = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+
+        let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let label: String = match &app.ed_id {
+            Some(id) => format!("{id}.txt"),
+            None => "new note".to_string(),
+        };
+        let name = gtk4::Label::new(Some(&label));
+        name.add_css_class("subtitle");
+        name.set_xalign(0.0);
+        name.set_hexpand(true);
+        set_direction(&name, app.ed_dir);
+        head.append(&name);
+
+        let state = gtk4::Label::new(Some(if app.dirty() {
+            "saving\u{2026}"
+        } else if app.touched {
+            "saved"
         } else {
-            "Saved"
+            ""
         }));
-        status.add_css_class(if app.dirty() { "warn" } else { "ok" });
-        toolbar.append(&status);
-        col.append(&toolbar);
+        state.add_css_class(if app.dirty() { "warn" } else { "ok" });
+        head.append(&state);
+        col.append(&head);
+        col.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
-        // The one widget that must do the text work.
         let view = gtk4::TextView::new();
         view.set_wrap_mode(gtk4::WrapMode::WordChar);
         view.set_hexpand(true);
@@ -454,7 +441,7 @@ impl Ui {
 
         let buffer = view.buffer();
         buffer.set_text(&app.ed_text);
-        apply_direction(&buffer, app.ed_dir);
+        set_direction(&view, app.ed_dir);
 
         buffer.connect_changed({
             let ui = self.clone();
@@ -463,64 +450,32 @@ impl Ui {
                 let mut app = ui.app.borrow_mut();
                 if app.ed_text != text {
                     app.ed_text = text;
+                    app.note_edited();
                     drop(app);
                     ui.clone().render_all();
                 }
             }
         });
+        col.append(&view);
 
-        let scroller = gtk4::ScrolledWindow::builder()
-            .child(&view)
-            .hexpand(true)
-            .vexpand(true)
-            .build();
-        scroller.add_css_class("note-surface");
-        col.append(&scroller);
+        let foot = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let count = gtk4::Label::new(Some(&self.stats(app)));
+        count.add_css_class("subtitle");
+        count.set_xalign(0.0);
+        count.set_hexpand(true);
+        foot.append(&count);
 
-        let footer = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let stats = gtk4::Label::new(Some(&self.stats(app)));
-        stats.add_css_class("subtitle");
-        stats.set_xalign(0.0);
-        stats.set_hexpand(true);
-        footer.append(&stats);
+        let hint = gtk4::Label::new(Some(&format!(
+            "{} save & close   \u{00b7}   {} close",
+            ui::pretty_key(&app.config.binding(Command::SaveClose)),
+            ui::pretty_key(&app.config.binding(Command::Back))
+        )));
+        hint.add_css_class("subtitle");
+        foot.append(&hint);
+        col.append(&foot);
 
-        if app.ed_id.is_some() {
-            let del = gtk4::Button::with_label("Delete");
-            del.add_css_class("ghost");
-            let id = app.ed_id.clone().unwrap();
-            del.connect_clicked({
-                let ui = self.clone();
-                move |_| ui.clone().dispatch(Action::ConfirmDelete(id.clone()))
-            });
-            footer.append(&del);
-        }
-        let cancel = gtk4::Button::with_label("Cancel");
-        cancel.add_css_class("ghost");
-        cancel.connect_clicked({
-            let ui = self.clone();
-            move |_| ui.clone().dispatch(Action::Cancel)
-        });
-        footer.append(&cancel);
-
-        let save = gtk4::Button::with_label(&format!(
-            "Save  {}",
-            ui::pretty_key(&app.config.binding(Command::SaveClose))
-        ));
-        save.add_css_class("primary");
-        save.connect_clicked({
-            let ui = self.clone();
-            move |_| ui.clone().dispatch(Action::Save { close: true })
-        });
-        footer.append(&save);
-        col.append(&footer);
-
-        if app.prompt.is_some() {
-            col.append(&self.clone().prompt_bar(app.prompt.clone().unwrap()));
-        }
         self.root.append(&col);
-
-        // Put the caret in the text immediately; otherwise the first keystroke
-        // goes nowhere, which is exactly the bug this rewrite had to fix.
+        // The caret must be in the note the instant the overlay appears.
         view.grab_focus();
     }
 
@@ -538,6 +493,17 @@ impl Ui {
     fn build_library(self: &Rc<Self>, app: &App) {
         let col = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
         col.append(&self.clone().header(format!("{} notes", app.order.len())));
+
+        // Adding from the list: the review flow is also a place you notice
+        // you need another note, and there is no capture key to hand.
+        let add = gtk4::Button::with_label("+  New note");
+        add.add_css_class("primary");
+        add.set_halign(gtk4::Align::Start);
+        add.connect_clicked({
+            let ui = self.clone();
+            move |_| ui.clone().dispatch(Action::NewNote)
+        });
+        col.append(&add);
 
         let search = gtk4::SearchEntry::new();
         search.set_text(&app.query);
@@ -617,7 +583,7 @@ impl Ui {
         title.set_xalign(0.0);
         title.set_hexpand(true);
         title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        set_widget_direction(&title, doc.direction);
+        set_direction(&title, doc.direction);
         head.append(&title);
 
         let badge = gtk4::Label::new(Some(if doc.direction == Direction::Rtl {
@@ -631,6 +597,19 @@ impl Ui {
             "badge-ltr"
         });
         head.append(&badge);
+
+        // Every row carries its own delete, rather than hiding it behind a
+        // hover state that is easy to miss.
+        let del = gtk4::Button::with_label("\u{2715}");
+        del.add_css_class("flat");
+        del.set_tooltip_text(Some("Delete this note"));
+        del.set_valign(gtk4::Align::Start);
+        del.connect_clicked({
+            let ui = self.clone();
+            let target = row.id.clone();
+            move |_| ui.clone().dispatch(Action::ConfirmDelete(target.clone()))
+        });
+        head.append(&del);
         inner.append(&head);
 
         let preview = match row.at {
@@ -646,7 +625,7 @@ impl Ui {
         p.set_wrap(true);
         p.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         p.set_max_width_chars(90);
-        set_widget_direction(&p, doc.direction);
+        set_direction(&p, doc.direction);
         inner.append(&p);
 
         let meta = gtk4::Label::new(Some(&format!(
@@ -949,50 +928,34 @@ impl Ui {
 
     fn wire_keys(self: Rc<Self>) {
         let controller = gtk4::EventControllerKey::new();
+        // Capture phase is required: in the bubble phase GtkTextView consumes
+        // Ctrl+S as text handling, so Save never ran while the editor had
+        // focus.
+        controller.set_propagation_phase(gtk4::PropagationPhase::Capture);
         self.window.add_controller(controller.clone());
 
-        // Recording takes priority: capture the next combination.
         controller.connect_key_pressed({
             let ui = self.clone();
-            move |_, key, _keycode, state| -> glib::Propagation {
-                let recording = ui.app.borrow().recording;
-                let Some(cmd) = recording else {
-                    return glib::Propagation::Proceed;
-                };
-                if key == gdk::Key::Escape {
-                    ui.app.borrow_mut().recording = None;
-                    ui.clone().render_all();
-                    return glib::Propagation::Stop;
-                }
-                match ui::combo_from(&key, &state) {
-                    Some(combo) => {
-                        ui.clone().dispatch(Action::SetBinding(cmd, combo));
-                        glib::Propagation::Stop
-                    }
-                    None => glib::Propagation::Proceed,
-                }
-            }
-        });
-
-        // Ordinary commands fire on press. Always return Proceed so the
-        // focused widget — above all the note editor — still receives typing.
-        controller.connect_key_pressed({
-            let ui = self.clone();
-            move |_, key, _keycode, state| {
-                let recording = ui.app.borrow().recording;
-                if let Some(cmd) = recording {
+            move |_, key, keycode, state| -> glib::Propagation {
+                // Recording a new binding takes priority over everything.
+                if let Some(cmd) = ui.app.borrow().recording {
                     if key == gdk::Key::Escape {
                         ui.app.borrow_mut().recording = None;
                         ui.clone().render_all();
                         return glib::Propagation::Stop;
                     }
-                    if let Some(combo) = ui::combo_from(&key, &state) {
+                    if let Some(combo) = ui::combo_from(&key, keycode, &state) {
                         ui.clone().dispatch(Action::SetBinding(cmd, combo));
                         return glib::Propagation::Stop;
                     }
                     return glib::Propagation::Proceed;
                 }
-                if let Some(action) = ui::combo_from(&key, &state).and_then(|c| action_for(&ui, &c)) {
+
+                // Hardware keycode, not the keysym: with a Hebrew layout GTK
+                // reports Ctrl+S as `hebrew_dalet`, so shortcuts taken from the
+                // keysym stop matching the moment you switch layouts.
+                let combo = ui::combo_from(&key, keycode, &state);
+                if let Some(action) = combo.as_deref().and_then(|c| action_for(&ui, c)) {
                     ui.clone().dispatch(action);
                 }
                 glib::Propagation::Proceed
@@ -1125,24 +1088,12 @@ fn setting_row(title: &str, sub: &str, control: gtk4::Widget) -> gtk4::Box {
 /// GTK4 dropped `pango_attr_direction_new`; base direction is a property on
 /// the buffer, and it is what drives Pango's bidi reordering. This is exactly
 /// what egui had no equivalent of.
-fn apply_direction(buffer: &gtk4::TextBuffer, dir: Direction) {
-    // Set through the property so this keeps working regardless of whether the
-    // bindings expose a typed setter for it.
-    buffer.set_property(
-        "direction",
-        match dir {
-            Direction::Ltr => gtk4::TextDirection::Ltr,
-            Direction::Rtl => gtk4::TextDirection::Rtl,
-        },
-    );
-}
-
-fn set_widget_direction(w: &impl IsA<gtk4::Widget>, dir: Direction) {
-    let ok = match dir {
-        Direction::Ltr => w.set_direction(gtk4::TextDirection::Ltr),
-        Direction::Rtl => w.set_direction(gtk4::TextDirection::Rtl),
-    };
-    let _ = ok;
+/// Set text direction on a widget that has the property.
+fn set_direction(w: &impl IsA<gtk4::Widget>, dir: Direction) {
+    w.set_direction(match dir {
+        Direction::Ltr => gtk4::TextDirection::Ltr,
+        Direction::Rtl => gtk4::TextDirection::Rtl,
+    });
 }
 
 /// Which command (if any) the released key combination means.

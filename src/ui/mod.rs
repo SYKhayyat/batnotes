@@ -8,8 +8,11 @@ use gtk4::gdk::ModifierType;
 pub mod gtk;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The overlay is always either *capturing* or *reviewing*.
+///
+/// There is no "chooser" view on purpose: pressing the hotkey must land the
+/// caret in an empty note, not in a menu asking what to do next.
 pub enum View {
-    Chooser,
     Editor,
     Library,
     Settings,
@@ -24,7 +27,6 @@ pub enum Action {
     ShowLibrary,
     OpenSettings,
     OpenNote(String),
-    ResumeNote(String),
     Back,
     Close,
     Save { close: bool },
@@ -110,6 +112,81 @@ pub fn pretty_key(k: &str) -> String {
         .join(" ")
 }
 
+/// Canonical key name from a **hardware keycode**.
+///
+/// This is the only layout-independent way to identify a key. GTK reports the
+/// keysym for the active layout, so Ctrl+S arrives as `hebrew_dalet` when the
+/// Hebrew layout is selected and `Ctrl+Shift+S` would never match. Users
+/// expect a shortcut to mean the physical key they pressed.
+///
+/// Codes are the standard Linux evdev values.
+pub fn key_name_from_keycode(code: u32) -> Option<&'static str> {
+    Some(match code {
+        1 => "Escape",
+        2..=11 => return Some(LETTERS_DIGITS[(code - 2) as usize]), // 1..0
+        12 => "Minus",
+        13 => "Equal",
+        14 => "Backspace",
+        15 => "Tab",
+        16..=25 => return Some(LETTERS[(code - 16) as usize]), // q..p
+        26 => "BracketLeft",
+        27 => "BracketRight",
+        28 => "Enter",
+        30..=38 => return Some(LETTERS[(code - 30 + 10) as usize]), // a..l
+        39 => "Semicolon",
+        40 => "Apostrophe",
+        41 => "Grave",
+        42 => "Backslash",
+        44..=50 => return Some(LETTERS[(code - 44 + 19) as usize]), // z..m
+        51 => "Comma",
+        52 => "Period",
+        53 => "Slash",
+        57 => "Space",
+        59..=68 => return Some(FUNCTION[(code - 59) as usize]),
+        71..=74 => return Some(NUMPAD[(code - 71) as usize]),
+        75 => "Insert",
+        76 => "End",
+        77 => "Down",
+        78 => "PageDown",
+        79 => "Left",
+        82 => "Home",
+        83 => "Up",
+        84 => "PageUp",
+        85 => "Right",
+        87 => "Insert",
+        88 => "End",
+        89 => "Down",
+        90 => "PageDown",
+        91 => "Left",
+        92 => "Up",
+        93 => "PageUp",
+        94 => "Right",
+        102 => "Home",
+        103 => "Up",
+        104 => "PageUp",
+        105 => "Left",
+        106 => "Right",
+        107 => "End",
+        108 => "Down",
+        109 => "PageDown",
+        110 => "Insert",
+        111 => "Delete",
+        _ => return None,
+    })
+}
+
+/// q w e r t y u i o p a s d f g h j k l z x c v b n m
+const LETTERS: [&str; 26] = [
+    "Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "A", "S", "D", "F", "G", "H", "J", "K", "L", "Z",
+    "X", "C", "V", "B", "N", "M",
+];
+/// 1 2 3 4 5 6 7 8 9 0
+const LETTERS_DIGITS: [&str; 10] = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"];
+const FUNCTION: [&str; 10] = [
+    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10",
+];
+const NUMPAD: [&str; 4] = ["Numpad7", "Numpad8", "Numpad9", "NumpadAdd"];
+
 /// Canonical key name for a keyval, in our binding syntax.
 pub fn key_name(key: &gtk4::gdk::Key) -> Option<String> {
     // Named keys first. Several of these (space, Escape, Tab, Return) also have
@@ -158,8 +235,17 @@ pub fn key_name(key: &gtk4::gdk::Key) -> Option<String> {
 }
 
 /// Build a binding from a key plus modifier state.
-pub fn combo_from(key: &gtk4::gdk::Key, state: &gtk4::gdk::ModifierType) -> Option<String> {
-    let name = key_name(key)?;
+pub fn combo_from(
+    key: &gtk4::gdk::Key,
+    keycode: u32,
+    state: &gtk4::gdk::ModifierType,
+) -> Option<String> {
+    // Prefer the hardware keycode; fall back to the keysym only when the
+    // keycode is not one we know.
+    let name = match key_name_from_keycode(keycode) {
+        Some(n) => n.to_string(),
+        None => key_name(key)?,
+    };
     let mut mods: Vec<&str> = Vec::new();
     if state.contains(ModifierType::CONTROL_MASK) {
         mods.push("Ctrl");
@@ -211,22 +297,46 @@ mod tests {
     #[test]
     fn letter_keys_become_bindings() {
         let m = ModifierType::empty();
-        assert_eq!(combo_from(&Key::s, &m).as_deref(), Some("S"));
+        // evdev code for S is 31.
+        assert_eq!(combo_from(&Key::s, 31, &m).as_deref(), Some("S"));
         let ctrl = ModifierType::CONTROL_MASK;
-        assert_eq!(combo_from(&Key::s, &ctrl).as_deref(), Some("Ctrl+S"));
+        assert_eq!(combo_from(&Key::s, 31, &ctrl).as_deref(), Some("Ctrl+S"));
+    }
+
+    #[test]
+    fn bindings_follow_the_hardware_key_not_the_layout() {
+        // With the Hebrew layout, GTK reports the S key as hebrew_dalet. A
+        // shortcut must still be Ctrl+S, because that is the physical key.
+        let ctrl = ModifierType::CONTROL_MASK;
+        let combo = combo_from(&Key::hebrew_dalet, 31, &ctrl);
+        assert_eq!(combo.as_deref(), Some("Ctrl+S"));
+    }
+
+    #[test]
+    fn keycode_table_matches_the_evdev_layout() {
+        assert_eq!(key_name_from_keycode(30), Some("A"));
+        assert_eq!(key_name_from_keycode(31), Some("S"));
+        assert_eq!(key_name_from_keycode(44), Some("Z"));
+        assert_eq!(key_name_from_keycode(57), Some("Space"));
+        assert_eq!(key_name_from_keycode(111), Some("Delete"));
+        assert_eq!(key_name_from_keycode(28), Some("Enter"));
+        assert_eq!(key_name_from_keycode(103), Some("Up"));
+        assert_eq!(key_name_from_keycode(2), Some("1"));
+        assert_eq!(key_name_from_keycode(9999), None);
     }
 
     #[test]
     fn named_keys_map_to_our_syntax() {
         let m = ModifierType::empty();
-        assert_eq!(combo_from(&Key::space, &m).as_deref(), Some("Space"));
-        assert_eq!(combo_from(&Key::Escape, &m).as_deref(), Some("Escape"));
+        assert_eq!(combo_from(&Key::space, 57, &m).as_deref(), Some("Space"));
+        assert_eq!(combo_from(&Key::Escape, 1, &m).as_deref(), Some("Escape"));
+        // evdev 51 is comma, 103 is Up.
         assert_eq!(
-            combo_from(&Key::comma, &ModifierType::ALT_MASK).as_deref(),
+            combo_from(&Key::comma, 51, &ModifierType::ALT_MASK).as_deref(),
             Some("Alt+Comma")
         );
         assert_eq!(
-            combo_from(&Key::Up, &ModifierType::ALT_MASK).as_deref(),
+            combo_from(&Key::Up, 103, &ModifierType::ALT_MASK).as_deref(),
             Some("Alt+Up")
         );
     }

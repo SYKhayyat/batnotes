@@ -150,28 +150,6 @@ impl Storage {
         Ok(())
     }
 
-    pub fn rename_to_match_content(&self, note: &Note, content: &str) -> Result<Note> {
-        let want = format!("{}.txt", model::filename_of(content));
-        let current = note
-            .path
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        if want == current {
-            return Ok(note.clone());
-        }
-        let target = self.notes_dir.join(&want);
-        if target.exists() {
-            // A different note already owns that name; keep ours as-is rather
-            // than silently merging two notes.
-            return Ok(note.clone());
-        }
-        fs::rename(&note.path, &target)?;
-        let _ = fs::remove_file(self.sidecar_path(&note.path));
-        self.write_direction(&target, note.direction)?;
-        Ok(Note { path: target, ..note.clone() })
-    }
-
     /// Copy an external `.txt` into the library, returning the new note.
     pub fn import_file(&self, src: &Path) -> Result<Note> {
         let content = fs::read_to_string(src).context("reading imported file")?;
@@ -326,17 +304,6 @@ mod tests {
             .filter(|n| n.contains("tmp"))
             .collect();
         assert!(strays.is_empty(), "left temp files: {strays:?}");
-    }
-
-    #[test]
-    fn rename_avoids_collisions() {
-        let d = tempfile::tempdir().unwrap();
-        let s = storage(d.path());
-        let a = s.save("aaa", "same title", Direction::Ltr).unwrap();
-        let b = s.save("bbb", "same title", Direction::Ltr).unwrap();
-        let renamed = s.rename_to_match_content(&a, "same title").unwrap();
-        assert_ne!(renamed.path, b.path);
-        assert!(renamed.path.exists());
     }
 
     #[test]
