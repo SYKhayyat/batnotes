@@ -1,6 +1,6 @@
 [package]
 name = "batnotes"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [lib]
@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 eframe = "0.29"
 egui = "0.29"
+egui_extras = { version = "0.29", features = ["syntect"] }
 global-hotkey = "0.6"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
@@ -21,6 +22,17 @@ dirs = "5"
 chrono = { version = "0.4", features = ["serde"] }
 tempfile = "3"
 anyhow = "1"
+zbus = { version = "4", default-features = false, features = ["blocking", "async-io"] }
+zvariant = "4"
+zbus_names = "3"
+x11-dl = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = true

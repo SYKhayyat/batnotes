@@ -1,0 +1,426 @@
+use anyhow::{anyhow, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use crate::model::Direction;
+
+/// Every command the app exposes. Order matters: it is the order the settings
+/// screen and the footer hint bar render in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Command {
+    Invoke,
+    ToggleOverlay,
+    NewNote,
+    OpenLibrary,
+    FocusSearch,
+    Save,
+    SaveClose,
+    Back,
+    Settings,
+    DeleteNote,
+    MoveUp,
+    MoveDown,
+    ToggleDirection,
+    TogglePreviewLines,
+}
+
+pub const ALL_COMMANDS: &[Command] = &[
+    Command::Invoke,
+    Command::ToggleOverlay,
+    Command::NewNote,
+    Command::OpenLibrary,
+    Command::FocusSearch,
+    Command::Save,
+    Command::SaveClose,
+    Command::Back,
+    Command::Settings,
+    Command::DeleteNote,
+    Command::MoveUp,
+    Command::MoveDown,
+    Command::ToggleDirection,
+    Command::TogglePreviewLines,
+];
+
+impl Command {
+    pub fn label(self) -> &'static str {
+        match self {
+            Command::Invoke => "Invoke / dismiss overlay",
+            Command::ToggleOverlay => "Show overlay",
+            Command::NewNote => "Chooser → New note",
+            Command::OpenLibrary => "Chooser → My notes",
+            Command::FocusSearch => "Focus library search",
+            Command::Save => "Save note (stay open)",
+            Command::SaveClose => "Save note and close",
+            Command::Back => "Back / close",
+            Command::Settings => "Open settings",
+            Command::DeleteNote => "Delete selected note",
+            Command::MoveUp => "Move note up",
+            Command::MoveDown => "Move note down",
+            Command::ToggleDirection => "Toggle RTL / LTR",
+            Command::TogglePreviewLines => "More / fewer preview lines",
+        }
+    }
+
+    pub fn detail(self) -> &'static str {
+        match self {
+            Command::Invoke => "Global. Works from any application.",
+            Command::ToggleOverlay => "Global. Toggles the overlay.",
+            Command::NewNote => "From the chooser.",
+            Command::OpenLibrary => "From the chooser.",
+            Command::FocusSearch => "In the library.",
+            Command::Save => "Keeps you in the editor.",
+            Command::SaveClose => "Returns you to the chooser.",
+            Command::Back => "Respects the unsaved-changes guard.",
+            Command::Settings => "From any view.",
+            Command::DeleteNote => "In the library. Always confirmed.",
+            Command::MoveUp => "In the library.",
+            Command::MoveDown => "In the library.",
+            Command::ToggleDirection => "In the editor.",
+            Command::TogglePreviewLines => "In the library.",
+        }
+    }
+
+    /// Only these can ever be global. The rest are meaningless without a
+    /// focused window, and advertising them as global would be a lie.
+    pub fn can_be_global(self) -> bool {
+        matches!(self, Command::Invoke | Command::ToggleOverlay)
+    }
+}
+
+pub type Bindings = BTreeMap<Command, String>;
+
+fn defaults() -> Vec<(Command, &'static str)> {
+    vec![
+        (Command::Invoke, "Meta+Shift+Space"),
+        (Command::ToggleOverlay, "Meta+Shift+Space"),
+        (Command::NewNote, "A"),
+        (Command::OpenLibrary, "B"),
+        (Command::FocusSearch, "Slash"),
+        (Command::Save, "Ctrl+S"),
+        (Command::SaveClose, "Ctrl+Enter"),
+        (Command::Back, "Escape"),
+        (Command::Settings, "Ctrl+Comma"),
+        (Command::DeleteNote, "Delete"),
+        (Command::MoveUp, "Alt+Up"),
+        (Command::MoveDown, "Alt+Down"),
+        (Command::ToggleDirection, "Ctrl+Shift+D"),
+        (Command::TogglePreviewLines, "Alt+BracketRight"),
+    ]
+}
+
+pub fn default_bindings() -> Bindings {
+    defaults().into_iter().map(|(k, v)| (k, v.to_string())).collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FocusLoss {
+    /// Close immediately when the editor is clean.
+    AutoHide,
+    /// Keep the overlay open and offer save / discard / stay.
+    Prompt,
+    /// Never close on focus loss; only the hotkey or Escape closes it.
+    Never,
+}
+
+impl FocusLoss {
+    pub fn label(self) -> &'static str {
+        match self {
+            FocusLoss::AutoHide => "Hide when clean",
+            FocusLoss::Prompt => "Keep open and ask",
+            FocusLoss::Never => "Never close",
+        }
+    }
+}
+
+impl Default for FocusLoss {
+    fn default() -> Self {
+        FocusLoss::Prompt
+    }
+}
+
+/// A named colour, so the palette is data rather than code and the user can
+/// retint the whole app without a rebuild.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Palette {
+    pub paper: String,
+    pub paper_raised: String,
+    pub ink: String,
+    pub ink_soft: String,
+    pub ink_faint: String,
+    pub accent: String,
+    pub clay: String,
+    pub rule: String,
+    pub wash: String,
+    pub danger: String,
+}
+
+impl Default for Palette {
+    fn default() -> Self {
+        // Prototype B's palette: warm paper, forest ink, sage accent.
+        Palette {
+            paper: "#fdfdf9".into(),
+            paper_raised: "#ffffff".into(),
+            ink: "#253d31".into(),
+            ink_soft: "#7b8179".into(),
+            ink_faint: "#a6afa4".into(),
+            accent: "#4b7a5c".into(),
+            clay: "#c28b69".into(),
+            rule: "#e4e9e0".into(),
+            wash: "#f4f7f1".into(),
+            danger: "#aa5e52".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Config {
+    pub notes_dir: PathBuf,
+    pub preview_lines: usize,
+    pub default_direction: Direction,
+    pub focus_loss: FocusLoss,
+    pub delete_empty_draft: bool,
+    pub fsync: bool,
+    pub restore_position: bool,
+    pub ui_font: Option<PathBuf>,
+    pub heading_font: Option<PathBuf>,
+    pub palette: Palette,
+    #[serde(default)]
+    pub bindings: Bindings,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Config {
+            notes_dir: default_notes_dir(),
+            preview_lines: 3,
+            default_direction: Direction::Rtl,
+            focus_loss: FocusLoss::Prompt,
+            delete_empty_draft: true,
+            fsync: true,
+            restore_position: true,
+            ui_font: None,
+            heading_font: None,
+            palette: Palette::default(),
+            bindings: default_bindings(),
+        }
+    }
+}
+
+/// XDG data dir rather than a dotfolder in $HOME.
+pub fn default_notes_dir() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("batnotes/notes")
+}
+
+pub fn config_path() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("batnotes/config.toml")
+}
+
+pub struct Loaded {
+    pub config: Config,
+    /// Set when an existing config was unreadable and defaults were substituted.
+    pub warning: Option<String>,
+}
+
+impl Config {
+    pub fn load(path: &Path) -> Result<Loaded> {
+        if !path.exists() {
+            let cfg = Config::default();
+            let _ = cfg.save(path);
+            return Ok(Loaded { config: cfg, warning: None });
+        }
+        let text = std::fs::read_to_string(path)?;
+        match toml::from_str::<Config>(&text) {
+            Ok(mut cfg) => {
+                // Merge in any binding added since the file was written, so a
+                // config from an older version keeps working.
+                let d = default_bindings();
+                for (k, v) in d {
+                    cfg.bindings.entry(k).or_insert(v);
+                }
+                let warnings = cfg.validate();
+                Ok(Loaded { config: cfg, warning: (!warnings.is_empty()).then(|| warnings.join("; ")) })
+            }
+            Err(e) => {
+                // DESIGN §10: keep the corrupt file, load defaults, say so.
+                let bak = path.with_extension("toml.bak");
+                let _ = std::fs::copy(path, &bak);
+                let cfg = Config::default();
+                let _ = cfg.save(path);
+                Ok(Loaded {
+                    config: cfg,
+                    warning: Some(format!(
+                        "Settings could not be read ({}). Defaults were restored; your old file is at {}",
+                        first_line(&e.to_string()),
+                        bak.display()
+                    )),
+                })
+            }
+        }
+    }
+
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let text = toml::to_string_pretty(self)?;
+        crate::storage::atomic_write(path, text.as_bytes(), self.fsync)
+    }
+
+    /// Returns human-readable problems. Empty means valid.
+    pub fn validate(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.preview_lines == 0 || self.preview_lines > 8 {
+            out.push(format!("preview_lines must be between 1 and 8 (is {})", self.preview_lines));
+        }
+        for c in ALL_COMMANDS.iter().copied() {
+            let Some(b) = self.bindings.get(&c) else {
+                out.push(format!("{} has no binding", c.label()));
+                continue;
+            };
+            if crate::hotkey::HotkeySpec::parse(b).is_err() {
+                out.push(format!("{} has an invalid binding: {b:?}", c.label()));
+            }
+        }
+        for c in self.binding_conflicts() {
+            out.push(format!("{} conflicts with another command", c.label()));
+        }
+        out
+    }
+
+    /// Commands whose binding collides with another command's. Both sides are
+    /// reported so the settings screen can flag the whole family.
+    ///
+    /// `Invoke` and `ToggleOverlay` share a key by design — they are two names
+    /// for the same global action — so they are exempt.
+    pub fn binding_conflicts(&self) -> Vec<Command> {
+        let exempt = |c: &Command| matches!(c, Command::Invoke | Command::ToggleOverlay);
+        let mut counts: BTreeMap<String, Vec<Command>> = BTreeMap::new();
+        for (cmd, b) in &self.bindings {
+            if exempt(cmd) {
+                continue;
+            }
+            if let Ok(spec) = crate::hotkey::HotkeySpec::parse(b) {
+                counts.entry(spec.normalised()).or_default().push(*cmd);
+            }
+        }
+        counts
+            .into_values()
+            .filter(|v| v.len() > 1)
+            .flatten()
+            .collect()
+    }
+
+    pub fn binding(&self, c: Command) -> String {
+        self.bindings
+            .get(&c)
+            .cloned()
+            .unwrap_or_else(|| "—".to_string())
+    }
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().next().unwrap_or("parse error").to_string()
+}
+
+pub fn parse_colour(hex: &str) -> Option<egui::Color32> {
+    let h = hex.trim().trim_start_matches('#');
+    let parse = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
+    match h.len() {
+        6 => Some(egui::Color32::from_rgb(parse(0)?, parse(2)?, parse(4)?)),
+        8 => Some(egui::Color32::from_rgba_unmultiplied(
+            parse(0)?, parse(2)?, parse(4)?, parse(6)?,
+        )),
+        _ => None,
+    }
+}
+
+pub fn to_hex(c: egui::Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+}
+
+#[allow(dead_code)]
+fn unused(_: Result<()>) -> Result<()> {
+    Err(anyhow!("unused"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        let cfg = Config::default();
+        cfg.save(&p).unwrap();
+        let loaded = Config::load(&p).unwrap();
+        assert_eq!(loaded.config.preview_lines, 3);
+        assert_eq!(loaded.config.bindings.len(), ALL_COMMANDS.len());
+        assert!(loaded.warning.is_none());
+    }
+
+    #[test]
+    fn new_binding_appears_for_old_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "preview_lines = 4\n").unwrap();
+        let loaded = Config::load(&p).unwrap();
+        // serde requires the non-default fields, so this asserts we tolerate a
+        // partial file rather than silently dropping user settings.
+        assert_eq!(loaded.config.preview_lines, 4);
+        assert_eq!(loaded.config.bindings.len(), ALL_COMMANDS.len());
+    }
+
+    #[test]
+    fn conflicts_are_detected_on_both_sides() {
+        let mut cfg = Config::default();
+        cfg.bindings.insert(Command::NewNote, "Ctrl+S".into());
+        let c = cfg.binding_conflicts();
+        assert!(c.contains(&Command::NewNote));
+        assert!(c.contains(&Command::Save));
+    }
+
+    #[test]
+    fn no_conflicts_by_default() {
+        // Invoke and ToggleOverlay intentionally share a key.
+        let cfg = Config::default();
+        let only_real = cfg
+            .binding_conflicts()
+            .into_iter()
+            .filter(|c| !matches!(c, Command::Invoke | Command::ToggleOverlay))
+            .collect::<Vec<_>>();
+        assert!(only_real.is_empty(), "unexpected conflicts: {only_real:?}");
+    }
+
+    #[test]
+    fn corrupt_config_is_backed_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        std::fs::write(&p, "this is not = = toml").unwrap();
+        let loaded = Config::load(&p).unwrap();
+        assert!(loaded.warning.is_some());
+        assert!(dir.path().join("config.toml.bak").exists());
+    }
+
+    #[test]
+    fn validate_flags_zero_preview_lines() {
+        let mut cfg = Config::default();
+        cfg.preview_lines = 0;
+        assert!(!cfg.validate().is_empty());
+    }
+
+    #[test]
+    fn colour_parsing() {
+        assert_eq!(parse_colour("#ffffff"), Some(egui::Color32::WHITE));
+        assert_eq!(parse_colour("nope"), None);
+    }
+}
