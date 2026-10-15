@@ -88,6 +88,9 @@ impl Ui {
         self.clone().wire_keys();
         self.clone().wire_focus();
         self.clone().render_all();
+        // current_view is seeded with Editor, so the change-gated resize in
+        // rebuild() never fires for the view we open in.
+        self.apply_size(View::Editor);
     }
 
     // ---- window control -------------------------------------------------
@@ -187,11 +190,6 @@ impl Ui {
             self.root.append(&ui.prompt_bar(p));
         }
         drop(app);
-
-        // Push the hint bar down instead of leaving dead space under a short view.
-        let spacer = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-        spacer.set_vexpand(true);
-        self.root.append(&spacer);
 
         if show_hints {
             self.root.append(&self.clone().hints_bar());
@@ -516,6 +514,7 @@ impl Ui {
 
         let list = gtk4::ListBox::new();
         list.set_selection_mode(gtk4::SelectionMode::Single);
+        list.set_vexpand(true);
         list.add_css_class("library");
         for (i, row) in app.rows.iter().enumerate() {
             let Some(doc) = app.index.get(&row.id) else { continue };
@@ -1011,7 +1010,7 @@ window {{ background: {paper}; }}
 }}
 .kbd.conflict {{ border-color: {danger}; color: {danger}; }}
 .note-surface {{ background: {raised}; border: 1px solid {rule}; border-radius: 8px; }}
-.note {{ background: {raised}; color: {ink}; font-size: 15px; }}
+.note {{ background: transparent; color: {ink}; font-size: 15px; }}
 .library, .keys {{ background: transparent; }}
 .note-row {{ padding: 9px 10px; border-radius: 8px; }}
 .note-row.selected {{ background: {wash}; }}
