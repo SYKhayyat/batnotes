@@ -282,3 +282,57 @@ mod tests {
         assert_eq!(next_stage(), "1");
     }
 }
+/// Keep the overlay above other windows.
+///
+/// GTK4 has no always-on-top API, and on Wayland a client cannot ask for one:
+/// the compositor owns stacking. KWin, however, exposes `keepAbove` through
+/// its scripting API, so we install a three-line script that applies it to
+/// our own window whenever it appears. Returns whether it took effect, so the
+/// setting can honestly report that it did nothing on this desktop.
+pub fn apply_keep_above(title: &str) -> bool {
+    let Some(state) = dirs::state_dir() else {
+        return false;
+    };
+    let _ = std::fs::create_dir_all(&state);
+    let path = state.join("batnotes-keep-above.js");
+    // Matched on the caption, which we set to the app name. Matching the
+    // resource class instead would catch every other GTK4 program on the
+    // desktop, since they all report "GTK Application".
+    let script = format!(
+        "function batnotesAbove(w) {{\n\
+         \x20   if (w.caption === {title:?}) {{ w.keepAbove = true; }}\n\
+         }}\n\
+         workspace.windowList().forEach(batnotesAbove);\n\
+         workspace.clientAdded.connect(batnotesAbove);\n"
+    );
+    if std::fs::write(&path, script).is_err() {
+        return false;
+    }
+    let Ok(conn) = zbus::blocking::Connection::session() else {
+        return false;
+    };
+    let iface: zbus_names::InterfaceName =
+        "org.kde.kwin.Scripting".try_into().unwrap();
+    let Ok(proxy) = zbus::blocking::Proxy::new(
+        &conn,
+        "org.kde.KWin",
+        "/Scripting",
+        iface,
+    ) else {
+        return false;
+    };
+    let file = path.to_string_lossy().to_string();
+    // Reloading is how the rule is re-applied: the script only walks the
+    // current window list, and our window already exists by the time we show
+    // it, so clientAdded will not fire for it again.
+    let _: zbus::Result<bool> = proxy.call("unloadScript", &"batnotes-keep-above");
+    // loadScript returns the new script id; start returns nothing. Decoding
+    // start as a bool fails and would silently read as "not supported".
+    let loaded: zbus::Result<i32> =
+        proxy.call("loadScript", &(file.as_str(), "batnotes-keep-above"));
+    if loaded.is_err() {
+        return false;
+    }
+    let started: zbus::Result<()> = proxy.call("start", &());
+    started.is_ok()
+}

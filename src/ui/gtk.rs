@@ -134,6 +134,18 @@ impl Ui {
         // present() asks the compositor for focus; asking the window as well
         // covers the case where it is already mapped and merely re-shown.
         self.window.grab_focus();
+
+        // Re-assert keep-above every time the overlay opens. Wayland clients
+        // cannot set this themselves, so the compositor has to be asked again
+        // — and only *after* the surface is mapped, because the script walks
+        // the list of existing windows. Once mapped, the compositor may still
+        // be catching up, hence the second attempt.
+        if self.app.borrow().config.keep_above {
+            crate::platform::apply_keep_above("batnotes");
+            glib::timeout_add_local_once(Duration::from_millis(250), || {
+                crate::platform::apply_keep_above("batnotes");
+            });
+        }
     }
 
     pub fn hide(&self) {
@@ -267,6 +279,11 @@ impl Ui {
     fn dispatch(self: Rc<Self>, a: Action) {
         let this = self.clone();
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // A signal can fire this while a borrow is already held; the
+            // action is simply dropped rather than aborting the daemon.
+            if this.app.try_borrow_mut().is_err() {
+                return;
+            }
             this.app.borrow_mut().dispatch(a);
             this.clone().render_all();
         }));
@@ -688,7 +705,12 @@ impl Ui {
                     let ui = self.clone();
                     move |b| {
                         let text = b.text(&b.start_iter(), &b.end_iter(), false).to_string();
-                        let mut app = ui.app.borrow_mut();
+                        // try_borrow, not borrow: this signal also fires from
+                        // set_text during a rebuild, which is already holding
+                        // the borrow that produced the text.
+                        let Ok(mut app) = ui.app.try_borrow_mut() else {
+                            return;
+                        };
                         if app.ed_text == text {
                             return;
                         }
@@ -807,11 +829,11 @@ impl Ui {
                 e.connect_search_changed({
                     let ui = self.clone();
                     move |ent| {
-                        let mut app = ui.app.borrow_mut();
-                        if app.query == ent.text().to_string() {
+                        // Same hazard as the text view: set_text during a
+                        // rebuild re-enters this handler.
+                        if ui.app.try_borrow_mut().is_err() {
                             return;
                         }
-                        drop(app);
                         ui.clone().dispatch(Action::SetQuery(ent.text().to_string()));
                     }
                 });
@@ -898,32 +920,22 @@ impl Ui {
         self.root.append(&col);
     }
 
-    fn note_row(self: Rc<Self>, app: &App, i: usize, row: &Row, doc: &crate::search::Doc) -> gtk4::ListBoxRow {
+    fn note_row(self: Rc<Self>, app: &App, i: usize, row: &Row, doc: &crate::search::Doc) -> gtk4::Widget {
         let r = gtk4::ListBoxRow::new();
         let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
 
         let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        // The title carries the note's own direction, so Hebrew titles read
-        // right-to-left inside an otherwise left-to-right list.
+        // No direction, no badge. Telling the reader which language a note is
+        // in is not information they asked for, and rendering each row
+        // right-to-left on its own made the list look like two different
+        // lists stacked on top of each other. Direction is applied where it
+        // matters: in the editor, when the note is opened.
         let title = gtk4::Label::new(Some(doc.title.as_str()));
         title.add_css_class("note-title");
         title.set_xalign(0.0);
         title.set_hexpand(true);
         title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        set_direction(&title, doc.direction);
         head.append(&title);
-
-        let badge = gtk4::Label::new(Some(if doc.direction == Direction::Rtl {
-            "HE · RTL"
-        } else {
-            "EN · LTR"
-        }));
-        badge.add_css_class(if doc.direction == Direction::Rtl {
-            "badge-rtl"
-        } else {
-            "badge-ltr"
-        });
-        head.append(&badge);
 
         // Every row carries its own delete, rather than hiding it behind a
         // hover state that is easy to miss.
@@ -952,100 +964,34 @@ impl Ui {
         p.set_wrap(true);
         p.set_ellipsize(gtk4::pango::EllipsizeMode::End);
         p.set_max_width_chars(90);
-        set_direction(&p, doc.direction);
         inner.append(&p);
 
         let meta = gtk4::Label::new(Some(&format!(
-            "{} · {} chars",
-            doc.path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
-            doc.content.chars().count()
+            "{} \u{00b7} {} chars",
+            pretty_ago(&doc.path),
+            doc.content.len()
         )));
         meta.add_css_class("subtitle");
         meta.set_xalign(0.0);
         inner.append(&meta);
 
         r.set_child(Some(&inner));
-        r.add_css_class("note-row");
-        if i == app.selected {
-            r.add_css_class("selected");
-        }
-        let id = row.id.clone();
-        r.set_activatable(true);
-        r.connect_activate({
-            let ui = self.clone();
-            let id = id.clone();
-            move |_| ui.clone().dispatch(Action::OpenNote(id.clone()))
-        });
-        r
+        r.upcast::<gtk4::Widget>()
     }
-
-    // ---- settings --------------------------------------------------------------
 
     fn build_settings(self: &Rc<Self>, app: &App) {
-        let col = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
-        col.append(&self.clone().header("settings".to_string()));
-
-        let tabs = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-        for t in Tab::ALL {
-            let b = gtk4::ToggleButton::with_label(t.label());
-            if t == app.settings_tab {
-                b.set_active(true);
-                b.add_css_class("on");
-            }
-            b.connect_clicked({
-                let ui = self.clone();
-                move |_| {
-                    ui.app.borrow_mut().settings_tab = t;
-                    ui.clone().render_all();
-                }
-            });
-            tabs.append(&b);
-        }
-        col.append(&tabs);
-
-        let page: gtk4::Widget = match app.settings_tab {
-            Tab::General => self.clone().general_page(app).upcast(),
-            Tab::Keys => self.clone().keys_page(app).upcast(),
-            Tab::Storage => self.clone().storage_page(app).upcast(),
-        };
-        let scroller = gtk4::ScrolledWindow::builder()
-            .child(&page)
+        let page = self.page();
+        page.set_spacing(4);
+        let scroll = gtk4::ScrolledWindow::builder()
+            .child(&self.settings_page(app))
             .vexpand(true)
-            .hexpand(true)
             .build();
-        col.append(&scroller);
-        self.root.append(&col);
+        page.append(&scroll);
+        self.root.append(&page);
     }
 
-    fn general_page(self: Rc<Self>, app: &App) -> gtk4::Box {
-        let b = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
-
-        b.append(&setting_row(
-            "Preview lines",
-            &format!("{} lines of each note in the library", app.config.preview_lines),
-            {
-                let ui = self.clone();
-                let uim = ui.clone();
-                let minus = gtk4::Button::with_label("−");
-                minus.add_css_class("ghost");
-                minus.connect_clicked(move |_| {
-                    let ui = uim.clone();
-                    let cur = ui.app.borrow().config.preview_lines;
-                    ui.clone().dispatch(Action::SetPreviewLines(cur.saturating_sub(1).max(1)));
-                });
-                let plus = gtk4::Button::with_label("+");
-                plus.add_css_class("ghost");
-                plus.connect_clicked(move |_| {
-                    let cur = ui.app.borrow().config.preview_lines;
-                    ui.clone().dispatch(Action::SetPreviewLines((cur + 1).min(8)));
-                });
-                let box_ = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
-                box_.append(&minus);
-                box_.append(&plus);
-                box_.upcast::<gtk4::Widget>()
-            },
-        ));
-
+    fn settings_page(self: &Rc<Self>, app: &App) -> gtk4::Box {
+        let b = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
         b.append(&setting_row(
             "Default direction",
             "Starting direction for new notes",
@@ -1102,6 +1048,22 @@ impl Ui {
                 let uic = ui.clone();
                 s.connect_state_set(move |_, v| {
                     uic.clone().dispatch(Action::SetFsync(v));
+                    glib::Propagation::Proceed
+                });
+                s.upcast::<gtk4::Widget>()
+            },
+        ));
+
+        b.append(&setting_row(
+            "Keep the overlay above other windows",
+            "So typing underneath does not bury what you are writing",
+            {
+                let ui = self.clone();
+                let s = gtk4::Switch::new();
+                s.set_active(app.config.keep_above);
+                let uic = ui.clone();
+                s.connect_state_set(move |_, v| {
+                    uic.clone().dispatch(Action::SetKeepAbove(v));
                     glib::Propagation::Proceed
                 });
                 s.upcast::<gtk4::Widget>()
@@ -1264,10 +1226,17 @@ impl Ui {
         controller.connect_key_pressed({
             let ui = self.clone();
             move |_, key, keycode, state| -> glib::Propagation {
+                keylog(&format!(
+                    "raw key={:?} code={keycode} state={:?}",
+                    key, state
+                ));
                 // Recording a new binding takes priority over everything.
-                if let Some(cmd) = ui.app.borrow().recording {
+                let recording = ui.app.try_borrow().ok().and_then(|a| a.recording);
+                if let Some(cmd) = recording {
                     if key == gdk::Key::Escape {
-                        ui.app.borrow_mut().recording = None;
+                        if let Ok(mut a) = ui.app.try_borrow_mut() {
+                            a.recording = None;
+                        }
                         ui.clone().render_all();
                         return glib::Propagation::Stop;
                     }
@@ -1282,6 +1251,7 @@ impl Ui {
                 // reports Ctrl+S as `hebrew_dalet`, so shortcuts taken from the
                 // keysym stop matching the moment you switch layouts.
                 let combo = ui::combo_from(&key, keycode, &state);
+                keylog(&format!("  combo={:?} action={:?}", combo, combo.as_deref().and_then(|c| action_for(&ui, c))));
                 if let Some(action) = combo.as_deref().and_then(|c| action_for(&ui, c)) {
                     ui.clone().dispatch(action);
                 }
@@ -1307,8 +1277,12 @@ impl Ui {
                         *ui2.refocus.borrow_mut() = false;
                         return;
                     }
-                    if ui2.app.borrow().visible {
-                        ui2.app.borrow_mut().on_focus_loss();
+                    if let Ok(mut app) = ui2.app.try_borrow_mut() {
+                        if !app.visible {
+                            return;
+                        }
+                        app.on_focus_loss();
+                        drop(app);
                         ui2.clone().render_all();
                     }
                 });
@@ -1519,6 +1493,18 @@ fn set_direction(w: &impl IsA<gtk4::Widget>, dir: Direction) {
 }
 
 /// Which command (if any) the released key combination means.
+/// Append a line to the file named by BATNOTES_KEYLOG, if set. Used to find
+/// out whether key events reach the window at all; off unless asked for.
+fn keylog(line: &str) {
+    let Ok(path) = std::env::var("BATNOTES_KEYLOG") else {
+        return;
+    };
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 /// Relative time from the file's mtime. Notes are files, so that is the only
 /// timestamp there is — and it is the one the filesystem agrees on.
 fn pretty_ago(path: &std::path::Path) -> String {

@@ -45,6 +45,7 @@ fn main() -> Result<()> {
     let ui = gtk::build(state, window);
     UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
 
+
     // Hotkey events, search results, toast expiry and focus loss all arrive
     // through this tick, so the daemon keeps working while hidden.
     glib::timeout_add_local(Duration::from_millis(50), move || {

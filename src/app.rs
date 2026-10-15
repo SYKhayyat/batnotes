@@ -645,6 +645,13 @@ impl App {
                     }
                 }
             },
+            Action::SetKeepAbove(v) => {
+                self.config.keep_above = v;
+                let _ = self.config.save(&self.config_path);
+                if v {
+                    crate::platform::apply_keep_above("batnotes");
+                }
+            }
             Action::Close => self.hide(),
         }
     }
