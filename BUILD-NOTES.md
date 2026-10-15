@@ -1,5 +1,41 @@
 # batnotes — build notes
 
+## 0. Framework: GTK4, not egui
+
+The UI was originally egui. It was replaced because **egui cannot render
+Hebrew correctly**, and Hebrew is a first-class requirement.
+
+egui's text layer maps codepoints through a font's `cmap`. It performs no
+shaping and no bidi. For Hebrew that means:
+
+* **No cursive joining** — final and medial forms are never selected, so words
+  render as isolated letters.
+* **No bidi reordering** — embedded numbers, Latin words and punctuation land
+  in the wrong position, so `רשימה 5 פריטים` comes out wrong.
+
+epaint states this outright; the source contains `TODO(emilk): heed bidi
+characters`. It is not a missing feature but a missing text engine.
+
+GTK4 was chosen because Pango provides shaping and bidi, and `GtkTextView`
+gives cursor, selection, clipboard, undo and IME for free. Everything else —
+palette, keycaps, hairline rows, the ruled surface — is CSS now.
+
+**RTL is handled by a real Pango base direction** on the buffer:
+
+```rust
+buffer.set_property("direction", gtk4::TextDirection::Rtl);
+```
+
+GTK4 removed `pango_attr_direction_new`; base direction is a property, and it
+is what actually drives reordering.
+
+### 0.1 What carried over unchanged
+
+The state machine, storage, search, config, hotkey chain and platform glue
+never depended on the GUI. `src/app.rs` is deliberately free of widget types,
+so the interesting logic is tested without a display (48 unit tests).
+
+
 `SRS.md` is the product spec. This file records where the build **diverges from
 it**, and why. Everything here is a deliberate decision, not a TODO.
 
@@ -118,20 +154,26 @@ src/
   search.rs    worker thread, debounce, ranking, snippets
   hotkey.rs    backend chain, key specs, desktop-shortcut installer, single-instance IPC
   ui/
-    theme.rs   palette + font families
-    kit.rs     keycaps, hairlines, banners, toasts, modals
-    chooser.rs editor.rs library.rs settings.rs
+    mod.rs     Action, View, Tab, key naming — no widget types
+    gtk.rs     the GTK4 front end and its CSS
   app.rs       state machine, key dispatch, focus-loss policy
   main.rs      startup, viewport, single instance
 ```
 
 ## 8. Tests
 
-`cargo test` — 32 unit tests covering storage atomicity and sidecars, manifest
+`cargo test` — 48 unit tests covering storage atomicity and sidecars, manifest
 reconciliation, search ranking and the 10k budget, binding parsing and
 conflict detection, corrupt-config backup, and id uniqueness.
 
 ## 9. Portability
+
+### 9.0 Runtime requirement
+
+**Any Linux with GTK4 installed.** That is `libgtk-4-1` / `gtk4` on Debian and
+Ubuntu, Fedora, Arch and openSUSE — a standard desktop package, not an exotic
+one. Notes stay plain `.txt`; nothing is stored in a GTK format.
+
 
 The build must run on any Linux, not just this machine. Three environment
 differences are handled in `src/platform.rs`; everything else is ordinary code.

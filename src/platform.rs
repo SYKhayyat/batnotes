@@ -45,6 +45,9 @@ const RUNTIME_LIBS: &[&str] = &[
     "libEGL_mesa.so.0",
     "libwayland-client.so.0",
     "libwayland-cursor.so.0",
+    // GTK is the UI toolkit now, so it belongs on the search path too.
+    "libgtk-4.so.1",
+    "libgdk-4.so.1",
     "libwayland-egl.so.1",
 ];
 
@@ -208,6 +211,11 @@ fn nix_store_lib_dirs() -> Vec<PathBuf> {
             || name.contains("libxcb")
             || name.contains("libxrender")
             || name.contains("libxfixes")
+            || name.contains("gtk4")
+            || name.contains("pango")
+            || name.contains("glib")
+            || name.contains("cairo")
+            || name.contains("pangoft2")
             || name.contains("wayland"))
         {
             continue;

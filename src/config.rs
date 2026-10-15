@@ -1,7 +1,8 @@
-use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+
+use anyhow::Result;
 
 use crate::model::Direction;
 
@@ -342,25 +343,40 @@ fn first_line(s: &str) -> String {
     s.lines().next().unwrap_or("parse error").to_string()
 }
 
-pub fn parse_colour(hex: &str) -> Option<egui::Color32> {
+/// `#rrggbb` or `#rrggbbaa` into components in 0.0..=1.0, which is what both
+/// GTK and CSS want.
+pub fn parse_colour(hex: &str) -> Option<Colour> {
     let h = hex.trim().trim_start_matches('#');
-    let parse = |i: usize| u8::from_str_radix(&h[i..i + 2], 16).ok();
-    match h.len() {
-        6 => Some(egui::Color32::from_rgb(parse(0)?, parse(2)?, parse(4)?)),
-        8 => Some(egui::Color32::from_rgba_unmultiplied(
-            parse(0)?, parse(2)?, parse(4)?, parse(6)?,
-        )),
-        _ => None,
+    let byte = |i: usize| u8::from_str_radix(h.get(i..i + 2)?, 16).ok();
+    let (r, g, b) = (byte(0)?, byte(2)?, byte(4)?);
+    let a = if h.len() >= 8 { byte(6)? } else { 255 };
+    Some(Colour {
+        r: r as f32 / 255.0,
+        g: g as f32 / 255.0,
+        b: b as f32 / 255.0,
+        a: a as f32 / 255.0,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Colour {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+    pub a: f32,
+}
+
+impl Colour {
+    /// CSS `rgba(...)`, which is what GTK's parser accepts.
+    pub fn css(&self) -> String {
+        format!(
+            "rgba({},{},{},{})",
+            (self.r * 255.0).round() as u8,
+            (self.g * 255.0).round() as u8,
+            (self.b * 255.0).round() as u8,
+            (self.a * 255.0).round() as u8
+        )
     }
-}
-
-pub fn to_hex(c: egui::Color32) -> String {
-    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
-}
-
-#[allow(dead_code)]
-fn unused(_: Result<()>) -> Result<()> {
-    Err(anyhow!("unused"))
 }
 
 #[cfg(test)]
@@ -431,7 +447,9 @@ mod tests {
 
     #[test]
     fn colour_parsing() {
-        assert_eq!(parse_colour("#ffffff"), Some(egui::Color32::WHITE));
+        let white = parse_colour("#ffffff").expect("valid hex");
+        assert_eq!((white.r, white.g, white.b, white.a), (1.0, 1.0, 1.0, 1.0));
         assert_eq!(parse_colour("nope"), None);
+        assert_eq!(parse_colour("#ff0000").unwrap().css(), "rgba(255,0,0,255)");
     }
 }

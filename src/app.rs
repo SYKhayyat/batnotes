@@ -1,5 +1,4 @@
 use anyhow::Result;
-use egui::{Context, Key};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,90 +9,62 @@ use crate::hotkey::{self, HotkeySpec};
 use crate::model::{self, Direction, Note};
 use crate::search::{Doc, Indexed, Match, Searcher};
 use crate::storage::Storage;
-use crate::ui::library::Row;
-use crate::ui::settings::Tab;
-use crate::ui::{self, kit, theme::Fonts, theme::Theme, Action, View};
+use crate::ui::{self, Action, Row, Tab, View};
 
-/// What the keyboard produced this frame.
-struct Keys {
-    combo: Option<String>,
-    pressed: bool,
-    escape: bool,
-    enter: bool,
-    tab: bool,
-    up: bool,
-    down: bool,
-    /// A real (not bare-modifier) key while recording.
-    recorded: Option<String>,
-}
-
-impl Default for Keys {
-    fn default() -> Self {
-        Keys { combo: None, pressed: false, escape: false, enter: false, tab: false, up: false, down: false, recorded: None }
-    }
-}
-
+/// Application state and the state machine.
+///
+/// Deliberately free of any GUI types: the GTK layer reads this and raises
+/// [`Action`]s, which keeps the interesting logic testable without a display.
 pub struct App {
-    config: Config,
-    config_path: PathBuf,
-    storage: Storage,
-    theme: Theme,
-    fonts: Fonts,
+    pub config: Config,
+    pub config_path: PathBuf,
+    pub storage: Storage,
+    pub total_bytes: u64,
 
-    hotkey: hotkey::Service,
-    hotkey_spec: HotkeySpec,
+    pub hotkey: hotkey::Service,
+    pub hotkey_spec: HotkeySpec,
 
-    index: Arc<Indexed>,
-    order: Vec<String>,
+    pub index: Arc<Indexed>,
+    pub order: Vec<String>,
     searcher: Searcher,
 
-    view: View,
-    prev_view: View,
+    pub view: View,
+    pub prev_view: View,
 
-    ed_id: Option<String>,
-    ed_text: String,
-    ed_original: String,
-    ed_dir: Direction,
-    ed_original_dir: Direction,
-    ed_is_new: bool,
-    /// Where Escape/Cancel should go when the editor closes.
-    ed_return: View,
+    pub ed_id: Option<String>,
+    pub ed_text: String,
+    pub ed_original: String,
+    pub ed_dir: Direction,
+    pub ed_original_dir: Direction,
+    pub ed_is_new: bool,
+    /// Where Escape/Cancel returns to.
+    pub ed_return: View,
 
-    query: String,
-    rows: Vec<Row>,
-    selected: usize,
-    hover: Option<usize>,
-    dragging: Option<usize>,
-    drag_over: Option<usize>,
+    pub query: String,
+    pub rows: Vec<Row>,
+    pub selected: usize,
+    pub last_query: String,
 
-    recording: Option<Command>,
-    settings_tab: Tab,
-    conflicts: HashSet<Command>,
+    pub recording: Option<Command>,
+    pub settings_tab: Tab,
+    pub conflicts: HashSet<Command>,
 
-    prompt: Option<String>,
-    confirm_delete: Option<String>,
-    toast: Option<(String, Instant)>,
-    config_warning: Option<String>,
-    storage_error: Option<String>,
+    pub prompt: Option<String>,
+    pub confirm_delete: Option<String>,
+    pub toast: Option<(String, Instant)>,
+    pub config_warning: Option<String>,
+    pub storage_error: Option<String>,
 
-    focus_editor: bool,
-    opened_at: Option<Instant>,
-    open_ms: Option<f32>,
-    visible: bool,
-    was_focused: bool,
-    total_bytes: u64,
+    pub visible: bool,
+    /// Set by the GUI layer when Escape/close was requested.
+    pub closing: bool,
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Result<Self> {
+    pub fn new() -> Result<App> {
         let config_path = crate::config::config_path();
         let loaded = Config::load(&config_path)?;
         let config = loaded.config;
-
-        let fonts = Fonts::load(&cc.egui_ctx, config.heading_font.clone(), config.ui_font.clone());
-        let theme = Theme::from_config(&config);
-        theme.apply(&cc.egui_ctx);
-        let _ = &fonts;
 
         let storage = Storage::new(&config);
         let (index, order, bytes) = Self::load_index(&storage);
@@ -111,8 +82,7 @@ impl App {
             config,
             config_path,
             storage,
-            theme,
-            fonts,
+            total_bytes: bytes,
             hotkey,
             hotkey_spec: invoke,
             index,
@@ -130,9 +100,7 @@ impl App {
             query: String::new(),
             rows: Vec::new(),
             selected: 0,
-            hover: None,
-            dragging: None,
-            drag_over: None,
+            last_query: String::new(),
             recording: None,
             settings_tab: Tab::General,
             conflicts,
@@ -141,12 +109,8 @@ impl App {
             toast: None,
             config_warning: loaded.warning,
             storage_error: None,
-            focus_editor: false,
-            opened_at: None,
-            open_ms: None,
             visible: false,
-            was_focused: false,
-            total_bytes: bytes,
+            closing: false,
         })
     }
 
@@ -169,7 +133,7 @@ impl App {
         )
     }
 
-    fn refresh(&mut self) {
+    pub fn refresh(&mut self) {
         let (index, order, bytes) = Self::load_index(&self.storage);
         self.index = index;
         self.order = order;
@@ -178,15 +142,37 @@ impl App {
         self.recompute_rows();
     }
 
-    fn dirty(&self) -> bool {
+    pub fn dirty(&self) -> bool {
         self.ed_text != self.ed_original || self.ed_dir != self.ed_original_dir
+    }
+
+    pub fn hebrew_count(&self) -> usize {
+        self.index
+            .ids()
+            .iter()
+            .filter(|id| {
+                self.index
+                    .get(id)
+                    .map(|d| d.direction == Direction::Rtl)
+                    .unwrap_or(false)
+            })
+            .count()
     }
 
     fn recompute_rows(&mut self) {
         if self.query.trim().is_empty() {
-            self.rows = self.order.iter().map(|id| Row { id: id.clone(), at: None }).collect();
+            self.rows = self
+                .order
+                .iter()
+                .map(|id| Row { id: id.clone(), at: None })
+                .collect();
         } else {
-            self.rows = self.index.ids().into_iter().map(|id| Row { id, at: None }).collect();
+            self.rows = self
+                .index
+                .ids()
+                .into_iter()
+                .map(|id| Row { id, at: None })
+                .collect();
         }
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
@@ -209,17 +195,14 @@ impl App {
         }
     }
 
-    // ---- visibility -----------------------------------------------------
+    // ---- visibility --------------------------------------------------
 
-    fn show(&mut self, ctx: &Context) {
-        self.opened_at = Some(Instant::now());
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    pub fn show(&mut self) {
         self.visible = true;
+        self.closing = false;
     }
 
-    fn hide(&mut self, ctx: &Context) {
-        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+    pub fn hide(&mut self) {
         self.visible = false;
         self.view = View::Chooser;
         self.ed_id = None;
@@ -232,13 +215,57 @@ impl App {
         self.recompute_rows();
     }
 
-    fn toast(&mut self, m: impl Into<String>) {
+    pub fn toggle(&mut self) {
+        if self.visible {
+            self.hide();
+        } else {
+            self.show();
+        }
+    }
+
+    /// Called every frame by the GUI layer.
+    pub fn pump(&mut self) {
+        while self.hotkey.rx.try_recv().is_ok() || hotkey::take_show_request() {
+            self.toggle();
+        }
+        if let Some(hits) = self.searcher.poll() {
+            self.apply_hits(hits);
+        }
+        if let Some((_, at)) = self.toast.clone() {
+            if at.elapsed() > Duration::from_millis(2600) {
+                self.toast = None;
+            }
+        }
+    }
+
+    pub fn toast(&mut self, m: impl Into<String>) {
         self.toast = Some((m.into(), Instant::now()));
+    }
+
+    // ---- focus loss ---------------------------------------------------
+
+    /// SRS 4.1: never silently discard work.
+    pub fn on_focus_loss(&mut self) {
+        match self.config.focus_loss {
+            FocusLoss::Never => {}
+            FocusLoss::AutoHide => {
+                if self.dirty() {
+                    self.prompt = Some(ui::PROMPT_FOCUS.into());
+                } else {
+                    self.hide();
+                }
+            }
+            FocusLoss::Prompt => {
+                if self.dirty() {
+                    self.prompt = Some(ui::PROMPT_FOCUS.into());
+                }
+            }
+        }
     }
 
     // ---- notes ----------------------------------------------------------
 
-    fn open_note(&mut self, id: &str) {
+    pub fn open_note(&mut self, id: &str) {
         let Some(doc) = self.index.get(id) else { return };
         self.ed_text = doc.content.as_ref().clone();
         self.ed_original = self.ed_text.clone();
@@ -249,10 +276,9 @@ impl App {
         self.ed_return = View::Library;
         self.view = View::Editor;
         self.prompt = None;
-        self.focus_editor = true;
     }
 
-    fn new_draft(&mut self) {
+    pub fn new_draft(&mut self) {
         self.ed_text.clear();
         self.ed_original.clear();
         self.ed_dir = self.config.default_direction;
@@ -262,15 +288,14 @@ impl App {
         self.ed_return = View::Chooser;
         self.view = View::Editor;
         self.prompt = None;
-        self.focus_editor = true;
     }
 
-    fn save(&mut self, close: bool) {
+    pub fn save(&mut self, close: bool) {
         if self.ed_text.trim().is_empty() && self.ed_is_new {
             if self.config.delete_empty_draft {
                 self.toast("Empty draft discarded");
                 if close {
-                    self.hide_nohide();
+                    self.hide();
                 } else {
                     self.view = View::Chooser;
                     self.ed_id = None;
@@ -305,24 +330,23 @@ impl App {
                 self.refresh();
                 self.toast(if close { "Saved" } else { "Saved · still open" });
                 if close {
-                    self.hide_nohide();
+                    self.hide();
                 }
             }
             Err(e) => self.storage_error = Some(format!("Could not save: {e}")),
         }
     }
 
-    /// Reset the buffer without touching window visibility.
-    fn hide_nohide(&mut self) {
-        self.view = View::Chooser;
+    fn leave_editor(&mut self) {
+        let back = self.ed_return;
+        self.view = back;
         self.ed_id = None;
         self.ed_text.clear();
         self.ed_original.clear();
-        self.confirm_delete = None;
-        self.prompt = None;
+        self.ed_original_dir = self.ed_dir;
     }
 
-    fn delete_note(&mut self, id: &str) {
+    pub fn delete_note(&mut self, id: &str) {
         if let Some(n) = self.note_by_id(id) {
             if let Err(e) = self.storage.delete(&n) {
                 self.storage_error = Some(format!("Could not delete: {e}"));
@@ -353,7 +377,7 @@ impl App {
         })
     }
 
-    fn move_note(&mut self, id: &str, delta: i32) {
+    pub fn move_note(&mut self, id: &str, delta: i32) {
         let Some(i) = self.order.iter().position(|x| x == id) else { return };
         let j = (i as i32 + delta).clamp(0, self.order.len() as i32 - 1) as usize;
         if i == j {
@@ -366,16 +390,36 @@ impl App {
         self.selected = j;
     }
 
-    // ---- dispatch --------------------------------------------------------
+    pub fn move_selected(&mut self, delta: i32) {
+        if let Some(row) = self.rows.get(self.selected) {
+            let id = row.id.clone();
+            self.move_note(&id, delta);
+        }
+    }
 
-    fn dispatch(&mut self, a: Action, ctx: &Context) {
+    pub fn open_selected(&mut self) {
+        if let Some(row) = self.rows.get(self.selected) {
+            let id = row.id.clone();
+            self.open_note(&id);
+        }
+    }
+
+    // ---- dispatch ---------------------------------------------------------
+
+    pub fn dispatch(&mut self, a: Action) {
         match a {
             Action::NewNote => self.new_draft(),
             Action::OpenLibrary => {
                 self.refresh();
                 self.query.clear();
+                self.last_query.clear();
                 self.recompute_rows();
                 self.ed_return = View::Library;
+                self.view = View::Library;
+            }
+            // Leave the draft intact when going to the library.
+            Action::ShowLibrary => {
+                self.refresh();
                 self.view = View::Library;
             }
             Action::OpenSettings => {
@@ -391,66 +435,51 @@ impl App {
                     if self.dirty() {
                         self.prompt = Some(ui::PROMPT_CANCEL.into());
                     } else {
-                        let back = self.ed_return;
-                        self.view = back;
-                        self.ed_id = None;
-                        self.ed_text.clear();
+                        self.leave_editor();
                     }
                 }
                 View::Library => {
                     self.view = View::Chooser;
                     self.query.clear();
+                    self.last_query.clear();
                     self.recompute_rows();
                 }
-                View::Chooser => self.hide(ctx),
+                View::Chooser => self.hide(),
             },
             Action::Save { close } => self.save(close),
             Action::Cancel => {
                 if self.dirty() {
                     self.prompt = Some(ui::PROMPT_CANCEL.into());
                 } else {
-                    let back = self.ed_return;
-                    self.view = back;
-                    self.ed_id = None;
-                    self.ed_text.clear();
+                    self.leave_editor();
                 }
-            }
-            // Jump from the editor straight to the library, and back again.
-            Action::ShowLibrary => {
-                self.ed_id = None;
-                self.ed_text.clear();
-                if self.ed_original.is_empty() {
-                    self.ed_original = String::new();
-                }
-                self.refresh();
-                self.query.clear();
-                self.recompute_rows();
-                self.ed_return = View::Library;
-                self.view = View::Library;
             }
             Action::Delete(id) | Action::ConfirmDeleteAccepted(id) => self.delete_note(&id),
             Action::ConfirmDelete(id) => self.confirm_delete = Some(id),
             Action::DismissConfirm => self.confirm_delete = None,
             Action::Move(id, d) => self.move_note(&id, d),
-            Action::SetQuery(q) => {
-                self.query = q;
-                self.searcher.submit(self.index.clone(), &self.query);
-                self.selected = 0;
-                self.recompute_rows();
-            }
-            Action::Select(i) => self.selected = i,
             Action::ReorderFocus(d) => {
                 if !self.rows.is_empty() {
                     self.selected =
                         (self.selected as i32 + d).clamp(0, self.rows.len() as i32 - 1) as usize;
                 }
             }
+            Action::Select(i) => self.selected = i,
+            Action::SetQuery(q) => {
+                if q != self.query {
+                    self.query = q.clone();
+                    self.last_query = q;
+                    self.searcher.submit(self.index.clone(), &self.query);
+                    self.selected = 0;
+                    self.recompute_rows();
+                }
+            }
             Action::SetDirection(d) => {
                 self.ed_dir = d;
-                if self.view != View::Editor {
-                    self.config.default_direction = d;
-                    let _ = self.config.save(&self.config_path);
-                }
+            }
+            Action::SetDefaultDirection(d) => {
+                self.config.default_direction = d;
+                let _ = self.config.save(&self.config_path);
             }
             Action::SetPreviewLines(n) => {
                 self.config.preview_lines = n;
@@ -464,12 +493,24 @@ impl App {
                 self.config.fsync = b;
                 let _ = self.config.save(&self.config_path);
             }
+            Action::SetUsePortal(b) => {
+                self.config.use_portal = b;
+                if !b {
+                    hotkey::forget_portal_failure();
+                }
+                let _ = self.config.save(&self.config_path);
+                self.toast(if b {
+                    "Portal enabled — restart to try it. It may be unstable on some desktops."
+                } else {
+                    "Portal disabled"
+                });
+            }
             Action::SetBinding(cmd, binding) => {
                 self.config.bindings.insert(cmd, binding.clone());
                 self.recording = None;
                 self.conflicts = self.config.binding_conflicts().into_iter().collect();
                 let _ = self.config.save(&self.config_path);
-                self.toast(format!("{} → {}", cmd.label(), kit::pretty_binding(&binding)));
+                self.toast(format!("{} → {}", cmd.label(), crate::ui::pretty_key(&binding)));
             }
             Action::ResetBindings => {
                 self.config.bindings = crate::config::default_bindings();
@@ -495,7 +536,7 @@ impl App {
                     self.prompt = None;
                     self.ed_text = self.ed_original.clone();
                     self.ed_dir = self.ed_original_dir;
-                    self.hide(ctx);
+                    self.hide();
                 }
                 ui::PROMPT_STAY => self.prompt = None,
                 ui::CONFIRM_DELETE => {
@@ -510,18 +551,6 @@ impl App {
                     .arg(&self.config.notes_dir)
                     .spawn();
             }
-            Action::SetUsePortal(b) => {
-                self.config.use_portal = b;
-                if !b {
-                    hotkey::forget_portal_failure();
-                }
-                let _ = self.config.save(&self.config_path);
-                self.toast(if b {
-                    "Portal enabled — restart batnotes to try it. It may be unstable on this desktop."
-                } else {
-                    "Portal disabled"
-                });
-            }
             Action::ApplyHotkey => match hotkey::install_desktop_shortcut(&self.hotkey_spec) {
                 Ok(()) => self.toast(format!(
                     "Desktop shortcut written · {}",
@@ -529,6 +558,7 @@ impl App {
                 )),
                 Err(e) => self.storage_error = Some(format!("Could not install shortcut: {e}")),
             },
+            Action::Close => self.hide(),
         }
     }
 
@@ -561,311 +591,7 @@ impl App {
         }
     }
 
-    // ---- keyboard --------------------------------------------------------
-
-    fn read_keys(ctx: &Context, recording: bool) -> Keys {
-        let mut state = Keys::default();
-        ctx.input(|i| {
-            state.pressed = !i.events.is_empty();
-            state.escape = i.key_pressed(Key::Escape);
-            state.enter = i.key_pressed(Key::Enter);
-            state.tab = i.key_pressed(Key::Tab);
-            state.up = i.key_pressed(Key::ArrowUp);
-            state.down = i.key_pressed(Key::ArrowDown);
-            for ev in &i.events {
-                let egui::Event::Key { key, pressed, repeat, .. } = ev else { continue };
-                if !pressed || *repeat {
-                    continue;
-                }
-                let name = key.name().to_string();
-                if recording {
-                    if matches!(
-                        name.as_str(),
-                        "Shift" | "Control" | "Alt" | "Super" | "Meta"
-                    ) {
-                        continue;
-                    }
-                    state.recorded = Some(combo_from_event(i.modifiers, &name));
-                } else if !matches!(name.as_str(), "Shift" | "Control" | "Alt" | "Super" | "Meta") {
-                    state.combo = Some(combo_from_event(i.modifiers, &name));
-                }
-            }
-        });
-        state
-    }
-
-    fn action_for(&mut self, combo: &str) -> Option<Action> {
-        let spec = HotkeySpec::parse(combo).ok()?;
-        let norm = spec.normalised();
-        let mut hit = None;
-        for (cmd, binding) in &self.config.bindings {
-            if HotkeySpec::parse(binding).map(|s| s.normalised()).ok().as_deref() == Some(norm.as_str()) {
-                hit = Some(*cmd);
-            }
-        }
-        let cmd = hit?;
-        let library_needs_selection = self.view == View::Library && !self.rows.is_empty();
-        let selected_id = || self.rows.get(self.selected).map(|r| r.id.clone());
-
-        Some(match cmd {
-            Command::Invoke | Command::ToggleOverlay => {
-                // Handled by the global-hotkey channel, not here.
-                return None;
-            }
-            Command::NewNote => Action::NewNote,
-            Command::OpenLibrary => Action::OpenLibrary,
-            Command::ShowLibrary if self.view == View::Editor => Action::ShowLibrary,
-            Command::Settings => Action::OpenSettings,
-            Command::Save => Action::Save { close: false },
-            Command::SaveClose => Action::Save { close: true },
-            Command::Back => Action::Back,
-            Command::FocusSearch => {
-                self.view = View::Library;
-                Action::Back
-            }
-            Command::ToggleDirection => Action::SetDirection(self.ed_dir.other()),
-            Command::TogglePreviewLines => {
-                let n = self.config.preview_lines;
-                Action::SetPreviewLines(if n >= 8 { 1 } else { n + 1 })
-            }
-            Command::DeleteNote if library_needs_selection => {
-                Action::ConfirmDelete(selected_id()?)
-            }
-            Command::MoveUp if library_needs_selection => Action::Move(selected_id()?, -1),
-            Command::MoveDown if library_needs_selection => Action::Move(selected_id()?, 1),
-            _ => return None,
-        })
-    }
-
-    fn on_focus_loss(&mut self, ctx: &Context) {
-        match self.config.focus_loss {
-            FocusLoss::Never => {}
-            FocusLoss::AutoHide => {
-                if !self.dirty() {
-                    self.hide(ctx);
-                } else {
-                    self.prompt = Some(ui::PROMPT_FOCUS.into());
-                }
-            }
-            FocusLoss::Prompt => {
-                if self.dirty() {
-                    self.prompt = Some(ui::PROMPT_FOCUS.into());
-                }
-            }
-        }
-    }
-
-    // ---- paint -----------------------------------------------------------
-
-    fn paint(&mut self, ctx: &Context) {
-        let mut out: Vec<Action> = Vec::new();
-        let th = self.theme.clone();
-
-        egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(th.paper).inner_margin(egui::Margin::symmetric(26.0, 20.0)))
-            .show(ctx, |ui: &mut egui::Ui| {
-                // Header
-                ui.horizontal(|ui| {
-                    kit::brand(ui, &th, 24.0);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if kit::icon_button(ui, &th, "✕", "Close").clicked() {
-                            out.push(Action::Back);
-                        }
-                        if kit::icon_button(ui, &th, "⚙", "Settings").clicked() {
-                            out.push(Action::OpenSettings);
-                        }
-                    });
-                });
-                ui.add_space(10.0);
-
-                // Warnings
-                if let Some(w) = self.config_warning.clone() {
-                    if kit::banner(ui, &th, kit::Tone::Warn, &w, vec![kit::BannerAction::quiet("dismiss", "Dismiss")]).is_some() {
-                        out.push(Action::DismissWarning);
-                    }
-                    ui.add_space(8.0);
-                }
-                if let Some(e) = self.storage_error.clone() {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new(e).size(11.0).color(th.danger));
-                }
-
-                // Focus-loss banner, non-modal per DESIGN 4.1
-                if self.prompt.as_deref() == Some(ui::PROMPT_FOCUS) {
-                    let actions = vec![
-                        kit::BannerAction::primary(ui::PROMPT_SAVE_CLOSE, "Save & close"),
-                        kit::BannerAction::quiet(ui::PROMPT_DISCARD, "Discard"),
-                        kit::BannerAction::quiet(ui::PROMPT_STAY, "Stay"),
-                    ];
-                    if let Some(id) = kit::banner(
-                        ui,
-                        &th,
-                        kit::Tone::Warn,
-                        "Unsaved changes — the overlay stays open so you don't lose capture.",
-                        actions,
-                    ) {
-                        out.push(Action::PromptAction(id));
-                    }
-                    ui.add_space(8.0);
-                }
-                if self.prompt.as_deref() == Some(ui::PROMPT_CANCEL) {
-                    let actions = vec![
-                        kit::BannerAction::primary(ui::PROMPT_SAVE_CLOSE, "Save instead"),
-                        kit::BannerAction::quiet(ui::PROMPT_DISCARD, "Discard"),
-                        kit::BannerAction::quiet(ui::PROMPT_STAY, "Keep editing"),
-                    ];
-                    if let Some(id) = kit::banner(
-                        ui,
-                        &th,
-                        kit::Tone::Danger,
-                        "Discard these changes?",
-                        actions,
-                    ) {
-                        out.push(Action::PromptAction(id));
-                    }
-                    ui.add_space(8.0);
-                }
-
-                ui.add_space(2.0);
-
-                // Body
-                match self.view {
-                    View::Chooser => {
-                        let idx = self.index.clone();
-                        let c = ui::chooser::Ctx {
-                            th: &th,
-                            cfg: &self.config,
-                            index: &idx,
-                            conflicts: &self.conflicts,
-                            note_count: self.order.len(),
-                            view: View::Chooser,
-                        };
-                        ui::chooser::show(ui, &c, &mut out);
-                    }
-                    View::Editor => {
-                        let mut dir = self.ed_dir;
-                        let mut text = std::mem::take(&mut self.ed_text);
-                        let mut c = ui::editor::Ctx {
-                            th: &th,
-                            cfg: &self.config,
-                            text: &mut text,
-                            original: &self.ed_original.clone(),
-                            direction: &mut dir,
-                            original_direction: self.ed_original_dir,
-                            is_new: self.ed_is_new,
-                            id: self.ed_id.clone(),
-                        };
-                        ui::editor::show(ui, &mut c, &mut out);
-                        self.ed_text = text;
-                        self.ed_dir = dir;
-                    }
-                    View::Library => {
-                        let rows = self.rows.clone();
-                        let idx = self.index.clone();
-                        let mut query = self.query.clone();
-                        let mut c = ui::library::Ctx {
-                            th: &th,
-                            cfg: &self.config,
-                            index: &idx,
-                            query: &mut query,
-                            rows: &rows,
-                            selected: self.selected,
-                            hover: self.hover,
-                            dragging: self.dragging,
-                            drag_over: self.drag_over,
-                            rebuilt: self.open_ms.is_some(),
-                        };
-                        ui::library::show(ui, &mut c, &mut out);
-                        if query != self.query {
-                            self.query = query;
-                        }
-                    }
-                    View::Settings => {
-                        let mut tab = self.settings_tab;
-                        let mut c = ui::settings::Ctx {
-                            th: &th,
-                            cfg: &self.config,
-                            tab: &mut tab,
-                            recording: &mut self.recording,
-                            conflicts: &self.conflicts,
-                            hotkey_backend: self.hotkey.status.backend.label(),
-                            hotkey_detail: &self.hotkey.status.detail,
-                            hotkey_ok: self.hotkey.status.backend != hotkey::Backend::None,
-                            note_count: self.order.len(),
-                            total_bytes: self.total_bytes,
-                            storage_error: self.storage_error.clone(),
-                            serif_loaded: self.fonts.serif_loaded,
-                            hebrew_loaded: self.fonts.hebrew_loaded,
-                        };
-                        ui::settings::show(ui, &mut c, &mut out);
-                        self.settings_tab = tab;
-                    }
-                }
-
-                // Footer hints, always live
-                ui.add_space(6.0);
-                let hints: Vec<(String, String)> = self
-                    .hints()
-                    .into_iter()
-                    .map(|(c, l)| (self.config.binding(c), String::from(l)))
-                    .collect();
-                let refs: Vec<(&str, &str)> =
-                    hints.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
-                kit::hint_bar(ui, &th, &refs);
-            });
-
-        // Delete confirmation over a scrim
-        if let Some(id) = self.confirm_delete.clone() {
-            let title = self
-                .index
-                .get(&id)
-                .map(|d| d.title.as_str())
-                .unwrap_or("this note")
-                .to_string();
-            let body = format!("“{title}” will be removed from disk. This cannot be undone — it is a real file, not a trash bin.");
-            let mut hit = false;
-            let mut keep = false;
-            egui::CentralPanel::default().show(ctx, |ui| {
-                let mut actions: Vec<kit::BannerAction> = Vec::new();
-                let _ = &mut actions;
-                hit = kit::confirm_card(
-                    ui,
-                    &th,
-                    360.0,
-                    "Delete this note?",
-                    &body,
-                    "Delete file",
-                    "Keep it",
-                    true,
-                    |ui| {
-                        ui.allocate_space(egui::vec2(0.0, 0.0));
-                    },
-                );
-                keep = false;
-            });
-            if hit {
-                out.push(Action::PromptAction(ui::CONFIRM_DELETE.into()));
-            }
-            let _ = keep;
-            // Keep the id alive across the borrow.
-            self.confirm_delete = Some(id);
-        }
-
-        // Toast
-        if let Some((msg, _)) = self.toast.clone() {
-            egui::TopBottomPanel::bottom("toast").show(ctx, |ui| {
-                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                    kit::toast(ui, &th, &msg);
-                });
-            });
-        }
-
-        for a in out {
-            self.dispatch(a, ctx);
-        }
-    }
-
-    fn hints(&self) -> Vec<(Command, &'static str)> {
+    pub fn hints(&self) -> Vec<(Command, &'static str)> {
         let mut v: Vec<(Command, &'static str)> = vec![];
         match self.view {
             View::Chooser => {
@@ -885,142 +611,169 @@ impl App {
             View::Settings => {}
         }
         v.push((Command::Settings, "settings"));
-        v.push((Command::Back, if self.view == View::Chooser { "close" } else { "back" }));
+        v.push((
+            Command::Back,
+            if self.view == View::Chooser { "close" } else { "back" },
+        ));
         v
     }
 }
 
-fn combo_from_event(mods: egui::Modifiers, key: &str) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if mods.ctrl {
-        parts.push("Ctrl".into());
-    }
-    if mods.alt {
-        parts.push("Alt".into());
-    }
-    if mods.shift {
-        parts.push("Shift".into());
-    }
-    if mods.command {
-        parts.push("Super".into());
-    }
-    let named = match key {
-        " " => "Space",
-        "Escape" => "Escape",
-        "Enter" => "Enter",
-        "ArrowUp" => "Up",
-        "ArrowDown" => "Down",
-        "ArrowLeft" => "Left",
-        "ArrowRight" => "Right",
-        "," => "Comma",
-        "/" => "Slash",
-        "[" => "BracketLeft",
-        "]" => "BracketRight",
-        k if k.chars().count() == 1 => {
-            let mut s = k.to_uppercase();
-            if let Some(c) = s.chars().next() {
-                s = c.to_string();
-            }
-            let s = s;
-            parts.push(s);
-            return parts.join("+");
-        }
-        _ => return String::new(),
-    };
-    parts.push(named.to_string());
-    parts.join("+")
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-impl eframe::App for App {
-    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
-        if hotkey::take_show_request() {
-            if self.visible {
-                self.hide(ctx);
-            } else {
-                self.show(ctx);
-            }
+    fn test_app(dir: &std::path::Path) -> App {
+        let mut cfg = Config::default();
+        cfg.notes_dir = dir.join("notes");
+        let storage = Storage::new(&cfg);
+        let (index, order, bytes) = App::load_index(&storage);
+        App {
+            config: cfg,
+            config_path: dir.join("config.toml"),
+            storage,
+            total_bytes: bytes,
+            hotkey: hotkey::Service {
+                rx: std::sync::mpsc::channel().1,
+                status: hotkey::Status {
+                    backend: hotkey::Backend::None,
+                    trigger_confirmed: false,
+                    detail: String::new(),
+                },
+            },
+            hotkey_spec: HotkeySpec::parse("Meta+Shift+Space").unwrap(),
+            index,
+            order,
+            searcher: Searcher::new(),
+            view: View::Chooser,
+            prev_view: View::Chooser,
+            ed_id: None,
+            ed_text: String::new(),
+            ed_original: String::new(),
+            ed_dir: Direction::Rtl,
+            ed_original_dir: Direction::Rtl,
+            ed_is_new: true,
+            ed_return: View::Chooser,
+            query: String::new(),
+            rows: Vec::new(),
+            selected: 0,
+            last_query: String::new(),
+            recording: None,
+            settings_tab: Tab::General,
+            conflicts: HashSet::new(),
+            prompt: None,
+            confirm_delete: None,
+            toast: None,
+            config_warning: None,
+            storage_error: None,
+            visible: false,
+            closing: false,
         }
-
-        while self.hotkey.rx.try_recv().is_ok() {
-            if self.visible {
-                self.hide(ctx);
-            } else {
-                self.show(ctx);
-            }
-        }
-
-        if let Some(t) = self.opened_at {
-            if t.elapsed() > Duration::from_millis(220) && self.open_ms.is_none() {
-                self.open_ms = Some(t.elapsed().as_secs_f32() * 1000.0);
-            }
-        }
-        if let Some(hits) = self.searcher.poll() {
-            self.apply_hits(hits);
-        }
-        if let Some((_, at)) = self.toast.clone() {
-            if at.elapsed() > Duration::from_millis(2600) {
-                self.toast = None;
-            }
-        }
-
-        let keys = Self::read_keys(ctx, self.recording.is_some());
-
-        if let Some(cmd) = self.recording {
-            if keys.escape {
-                self.recording = None;
-            } else if let Some(combo) = keys.recorded {
-                if HotkeySpec::parse(&combo).is_ok() {
-                    self.dispatch(Action::SetBinding(cmd, combo), ctx);
-                } else {
-                    self.toast("Not a usable combination");
-                }
-            }
-        } else if self.visible {
-            if let Some(combo) = keys.combo.clone() {
-                if let Some(a) = self.action_for(&combo) {
-                    self.dispatch(a, ctx);
-                }
-            }
-            if keys.up {
-                self.dispatch(Action::ReorderFocus(-1), ctx);
-            }
-            if keys.down {
-                self.dispatch(Action::ReorderFocus(1), ctx);
-            }
-            if keys.enter {
-                if let Some(id) = self.rows.get(self.selected).map(|r| r.id.clone()) {
-                    self.open_note(&id);
-                }
-            }
-
-            // Focus loss only counts after the window has been focused once,
-            // otherwise the first frame after showing would close it again.
-            let focused = ctx.input(|i| i.focused);
-            if focused {
-                self.was_focused = true;
-            } else if self.was_focused && self.visible {
-                self.was_focused = false;
-                self.on_focus_loss(ctx);
-            }
-        }
-
-        // A panic while painting must not take the daemon down: the whole point
-        // of this app is that it is always there for the next capture. Catch
-        // it, record it, and fall back to a usable view.
-        let painted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.paint(ctx)));
-        if painted.is_err() {
-            self.storage_error = Some(
-                "The last screen could not be drawn — see crash.log. The app is still running.".into(),
-            );
-            self.view = View::Chooser;
-            self.ed_id = None;
-            self.ed_text.clear();
-            self.confirm_delete = None;
-        }
-        ctx.request_repaint_after(Duration::from_millis(80));
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
-        let _ = std::fs::remove_file(hotkey::socket_path());
+    #[test]
+    fn dirty_tracks_text_and_direction() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.new_draft();
+        assert!(!a.dirty());
+        a.ed_text = "שלום".into();
+        assert!(a.dirty());
+        a.ed_text = a.ed_original.clone();
+        assert!(!a.dirty());
+        a.ed_dir = Direction::Ltr;
+        assert!(a.dirty(), "direction change alone is a real edit");
+    }
+
+    #[test]
+    fn focus_loss_never_discards_work() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.config.focus_loss = FocusLoss::AutoHide;
+        a.new_draft();
+        a.ed_text = "unsaved".into();
+        a.visible = true;
+        a.on_focus_loss();
+        assert!(a.visible, "must not close with unsaved text");
+        assert_eq!(a.prompt.as_deref(), Some(ui::PROMPT_FOCUS));
+    }
+
+    #[test]
+    fn focus_loss_hides_when_clean() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.config.focus_loss = FocusLoss::AutoHide;
+        a.visible = true;
+        a.on_focus_loss();
+        assert!(!a.visible);
+    }
+
+    #[test]
+    fn save_creates_a_note_and_clears_dirty() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.new_draft();
+        a.ed_text = "hello".into();
+        a.save(false);
+        assert!(!a.dirty());
+        assert_eq!(a.order.len(), 1);
+    }
+
+    #[test]
+    fn empty_draft_is_discarded_without_touching_disk() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.new_draft();
+        a.save(false);
+        assert!(a.order.is_empty());
+    }
+
+    #[test]
+    fn back_from_editor_returns_to_library() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.new_draft();
+        a.ed_text = "x".into();
+        a.save(false);
+        a.dispatch(Action::OpenLibrary);
+        a.open_selected();
+        assert_eq!(a.view, View::Editor);
+        a.dispatch(Action::Back);
+        assert_eq!(a.view, View::Library, "Back must return to the library, not the chooser");
+    }
+
+    #[test]
+    fn delete_requires_confirmation() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.new_draft();
+        a.ed_text = "gone soon".into();
+        a.save(false);
+        let id = a.order[0].clone();
+        a.dispatch(Action::ConfirmDelete(id.clone()));
+        assert_eq!(a.order.len(), 1, "confirming must not delete yet");
+        a.dispatch(Action::ConfirmDeleteAccepted(id));
+        assert!(a.order.is_empty());
+    }
+
+    #[test]
+    fn direction_survives_a_round_trip() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.new_draft();
+        a.ed_dir = Direction::Rtl;
+        a.ed_text = "רשימה\nחלה, יין".into();
+        a.save(false);
+        let id = a.order[0].clone();
+        a.dispatch(Action::OpenNote(id));
+        assert_eq!(a.ed_dir, Direction::Rtl, "F8: direction is preserved");
+        assert_eq!(a.ed_text, "רשימה\nחלה, יין");
+    }
+
+    #[test]
+    fn hints_are_live_for_the_current_view() {
+        let d = tempfile::tempdir().unwrap();
+        let a = test_app(d.path());
+        assert!(a.hints().iter().any(|(c, _)| *c == Command::NewNote));
     }
 }

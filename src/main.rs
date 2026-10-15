@@ -1,18 +1,27 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use batnotes::app::App;
 use batnotes::hotkey;
 use batnotes::platform;
-use eframe::egui;
+use batnotes::ui::gtk;
+use gtk4::glib;
+
+// Keep the UI alive for the life of the process. The overlay outlives having
+// no visible window, so the window is created once and only ever hidden. A
+// GTK `Application` would tie the process lifetime to window destruction,
+// which is the opposite of what a daemon needs.
+thread_local! {
+    static UI: std::cell::RefCell<Option<std::rc::Rc<gtk::Ui>>> =
+        const { std::cell::RefCell::new(None) };
+}
 
 fn main() -> Result<()> {
-    // Fix the loader path before anything touches a windowing library. This may
-    // re-exec the process.
     platform::install_panic_log();
     platform::prepare();
 
     // Single instance. A second `batnotes --show` — which is what the desktop
-    // shortcut launches — hands the request to the running daemon and exits, so
-    // the shortcut never opens a competing window.
+    // shortcut launches — hands the request to the running daemon and exits.
     let listener = hotkey::serve_single_instance()?;
     if listener.is_none() {
         return Ok(());
@@ -21,29 +30,28 @@ fn main() -> Result<()> {
         hotkey::publish_listener(l);
     }
 
-    let viewport = egui::ViewportBuilder::default()
-        .with_title("batnotes")
-        .with_inner_size([600.0, 460.0])
-        .with_min_inner_size([400.0, 240.0])
-        .with_decorations(false)
-        .with_resizable(true)
-        .with_always_on_top()
-        .with_visible(false)
-        .with_app_id("batnotes");
+    // GTK initialises the display backend; everything that touches widgets has
+    // to come after this.
+    gtk4::init().map_err(|_| anyhow::anyhow!("gtk::init failed — no display available"))?;
 
-    let options = eframe::NativeOptions {
-        viewport,
-        ..Default::default()
-    };
+    let state = App::new()?;
+    let window = gtk4::Window::builder()
+        .title("batnotes")
+        .default_width(620)
+        .default_height(470)
+        .resizable(true)
+        .build();
 
-    match eframe::run_native(
-        "batnotes",
-        options,
-        Box::new(|cc| Ok(Box::new(App::new(cc)?))),
-    ) {
-        Ok(()) => Ok(()),
-        // winit can only build one event loop per process, so the XWayland
-        // fallback has to be a fresh process rather than a second call.
-        Err(e) => platform::retry_on_xwayland(&format!("batnotes failed to start: {e}")),
-    }
+    let ui = gtk::build(state, window);
+    UI.with(|slot| *slot.borrow_mut() = Some(ui.clone()));
+
+    // Hotkey events, search results, toast expiry and focus loss all arrive
+    // through this tick, so the daemon keeps working while hidden.
+    glib::timeout_add_local(Duration::from_millis(50), move || {
+        ui.clone().tick();
+        glib::ControlFlow::Continue
+    });
+
+    glib::MainLoop::new(None, false).run();
+    Ok(())
 }

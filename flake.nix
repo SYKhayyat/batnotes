@@ -30,8 +30,10 @@
       };
     in
     {
-      packages.${system}.default = batnotes;
-      packages.${system}.batnotes = batnotes;
+      packages.${system} = {
+        default = batnotes;
+        inherit batnotes;
+      };
 
       devShells.${system}.default = pkgs.mkShell {
         packages = with pkgs; [
