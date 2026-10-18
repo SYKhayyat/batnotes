@@ -256,7 +256,6 @@ pub struct Config {
     /// Second global key: opens the note list directly. The invoke key is
     /// capture-only, so review needs its own entry point.
     pub notes_hotkey: String,
-    pub restore_position: bool,
     pub ui_font: Option<PathBuf>,
     pub heading_font: Option<PathBuf>,
     pub theme: Theme,
@@ -278,7 +277,6 @@ impl Default for Config {
             use_portal: false,
             keep_above: true,
             notes_hotkey: "Meta+Shift+L".to_string(),
-            restore_position: true,
             ui_font: None,
             heading_font: None,
             theme: Theme::Light,

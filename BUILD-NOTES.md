@@ -248,18 +248,60 @@ also stops the overlay closing, because closing implies it was captured.
 * `Ui::signature` fingerprinted `rows.len()` but not the query, so searching
   for something with three hits and then something else with three hits left
   the first results on screen. It now includes the query, the selection, the
-  settings tab and the notice state.
+  settings tab, the conflict count and the second global key.
 * A signal fired *during* a rebuild (the search box's own `set_text`) started a
   second rebuild inside the first, and the two fought over the same widgets —
   GTK rejected the appends and the view came out half built. Rebuilds are now
   non-reentrant, and the search handler ignores a value it already has.
 
+## 7.6 The keys screen has to tell the truth
+
+Rebinding used to make the UI disagree with reality in three ways:
+
+* **A global key was shown but not active.** The trigger is registered once, at
+  startup. After a rebind every button and hint advertised a shortcut the
+  compositor was not listening for. `trigger_restart_pending` now says so, and
+  stays set until the app restarts — changing an in-app binding meanwhile does
+  not make the global one real again.
+* **`Invoke` and `ToggleOverlay` could diverge.** They are two names for one
+  global action and share a key by design, but editing one left the other
+  displaying a shortcut nothing listened for. Editing either now edits both.
+* **The second global key was invisible.** `config.notes_hotkey` — the
+  shortcut that goes straight to the list — is a config field, not a command,
+  so the loop over `ALL_COMMANDS` could not render it. It now has a row, a
+  Record button, and a conflict marker when it collides with `Invoke`.
+
+Bindings are stored by name but matched against names read from a hardware
+keycode, so a binding naming a key the table cannot produce can never fire.
+`every_default_binding_survives_the_hardware_keycode_path` now checks every
+shipped binding through that path. Writing it found a real defect: code 42 is
+`KEY_LEFTSHIFT`, which `is_modifier_keycode` already treated as a modifier, yet
+the name table called it `Backslash` — a backslash binding could never resolve.
+`KEY_BACKSLASH` is 43.
+
+## 7.7 The window cannot be moved, and no amount of code will do it
+
+`restore_position` was in the config from the start and nothing read it. It
+cannot be implemented: GTK4 removed `gtk_window_move`, and `gdk_toplevel_begin_move`
+needs a `GdkToplevel`, which is not obtainable from a `GtkWindow` —
+`gtk_native_get_toplevel` does not exist, and `GtkWindow` does not implement the
+interface (`native.type_().is_a(GdkToplevel)` is false, checked at runtime).
+There is no public GTK4 API by which a client asks a Wayland compositor to move
+its own toplevel.
+
+So the flag is gone rather than left in the config implying something the
+platform will not do. The overlay keeps its position for the life of the
+session, because it is one long-lived window that is only hidden and shown; a
+restart puts it back wherever the compositor chooses. `export_note` now has a
+button, which was the last action in the enum with no way to reach it.
+
 ## 8. Tests
 
-`cargo test` — 64 unit tests covering storage atomicity and sidecars, manifest
+`cargo test` — 70 unit tests covering storage atomicity and sidecars, manifest
 reconciliation, search ranking and the 10k budget, binding parsing and
 conflict detection, corrupt-config backup, id uniqueness, direction inference,
-reorder persistence, and a filtered list surviving a save.
+reorder persistence, a filtered list surviving a save, global-key rebinding and
+every shipped binding's survival of the hardware-keycode path.
 
 ## 9. Portability
 

@@ -15,6 +15,7 @@ use gtk4::glib;
 
 use crate::app::App;
 use crate::config::{self, Command, FocusLoss};
+use crate::hotkey::HotkeySpec;
 use crate::model::Direction;
 use crate::ui::{self, Action, Row, View};
 
@@ -196,7 +197,6 @@ impl Ui {
     }
 
     /// Cheap fingerprint of everything the tree depends on.
-    /// What the tree is built from.
     ///
     /// Deliberately excludes the note text. The editor is a live widget now,
     /// so a keystroke changes nothing structural — but counting characters
@@ -209,7 +209,7 @@ impl Ui {
     fn signature(&self) -> String {
         let a = self.app.borrow();
         format!(
-            "{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}",
+            "{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}|{}|{:?}|{:?}|{}",
             a.view,
             a.ed_id,
             a.ed_dir == Direction::Rtl,
@@ -224,6 +224,10 @@ impl Ui {
             a.config.theme == config::Theme::Dark,
             a.storage_error.is_some(),
             a.ed_id.is_none(),
+            a.conflicts.len(),
+            a.trigger_restart_pending,
+            a.recording_global,
+            a.config.notes_hotkey,
         )
     }
 
@@ -270,8 +274,8 @@ impl Ui {
             self.root.append(&ui.prompt_bar(p));
         }
         drop(app);
-        let hb = self.clone().hints_bar();
-        self.root.append(&hb);
+
+        self.root.append(&self.clone().hints_bar());
         if self.last_toast.borrow().is_some() {
             self.root.append(&self.toast.clone());
         }
@@ -879,10 +883,21 @@ impl Ui {
         // Delete is here as well as on the row, so a note can be removed from
         // where it is being read.
         if let Some(id) = app.ed_id.clone() {
+            let exp = gtk4::Button::with_label("Export");
+            exp.add_css_class("ghost");
+            exp.set_tooltip_text(Some("Write a copy to your downloads folder"));
+            exp.connect_clicked({
+                let ui = self.clone();
+                let target = id.clone();
+                move |_| ui.clone().dispatch(Action::ExportNote(target.clone()))
+            });
+            foot.append(&exp);
+
             let del = self.key_button("Delete", Command::DeleteNote, "ghost");
             del.connect_clicked({
                 let ui = self.clone();
-                move |_| ui.clone().dispatch(Action::ConfirmDelete(id.clone()))
+                let target = id.clone();
+                move |_| ui.clone().dispatch(Action::ConfirmDelete(target.clone()))
             });
             foot.append(&del);
         }
@@ -1351,16 +1366,17 @@ impl Ui {
 
             let l = gtk4::Label::new(Some(cmd.label()));
             l.set_xalign(0.0);
-            l.set_hexpand(true);
+            // The command keeps its natural width and the description takes the
+            // slack, so the keys stay in one column and the description is not
+            // squeezed into two short lines.
+            l.set_hexpand(false);
             l.set_wrap(true);
             l.set_valign(gtk4::Align::Center);
             inner.append(&l);
             let detail = gtk4::Label::new(Some(cmd.detail()));
             detail.add_css_class("subtitle");
             detail.set_xalign(0.0);
-            // Not expanding: the command name takes the slack so the keys stay
-            // aligned in a column instead of drifting into the middle.
-            detail.set_hexpand(false);
+            detail.set_hexpand(true);
             detail.set_wrap(true);
             detail.set_valign(gtk4::Align::Center);
             inner.append(&detail);
@@ -1396,7 +1412,27 @@ impl Ui {
             }
             list.append(&row);
         }
+        // The second global key is a config field, not a command, so the loop
+        // above cannot render it. It was therefore unviewable and uneditable
+        // while being a real entry point.
+        list.append(&self.notes_hotkey_row(app));
+
         b.append(&list);
+
+        // The global trigger is registered once, at startup. If what is
+        // configured no longer matches what the compositor is holding, say so:
+        // otherwise every button in the app advertises a shortcut that does
+        // nothing yet.
+        if app.trigger_restart_pending {
+            let n = gtk4::Label::new(Some(
+                "The global keys changed, but the compositor still holds the old ones. \
+                 They take effect the next time batnotes starts.",
+            ));
+            n.add_css_class("warn");
+            n.set_wrap(true);
+            n.set_xalign(0.0);
+            b.append(&n);
+        }
 
         let reset = gtk4::Button::with_label("Reset all bindings");
         reset.add_css_class("ghost");
@@ -1438,6 +1474,62 @@ impl Ui {
             b.append(&apply);
         }
         b
+    }
+
+    /// The "open my notes" global key, which lives in the config rather than
+    /// in the bindings table.
+    fn notes_hotkey_row(self: &Rc<Self>, app: &App) -> gtk4::ListBoxRow {
+        let row = gtk4::ListBoxRow::new();
+        row.add_css_class("keys-row");
+        let inner = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+
+        let l = gtk4::Label::new(Some("Go straight to My notes"));
+        l.set_xalign(0.0);
+        l.set_hexpand(true);
+        l.set_wrap(true);
+        l.set_valign(gtk4::Align::Center);
+        inner.append(&l);
+
+        let detail = gtk4::Label::new(Some("Global. Opens the list without capturing."));
+        detail.add_css_class("subtitle");
+        detail.set_xalign(0.0);
+        detail.set_hexpand(true);
+        detail.set_wrap(true);
+        detail.set_valign(gtk4::Align::Center);
+        inner.append(&detail);
+
+        // Two globals on one key means one of them never fires.
+        let clash = HotkeySpec::parse(&app.config.notes_hotkey)
+            .ok()
+            .zip(HotkeySpec::parse(&app.config.binding(Command::Invoke)).ok())
+            .map(|(a, b)| a.normalised() == b.normalised())
+            .unwrap_or(false);
+        let cap = keycap(&app.config.notes_hotkey);
+        if clash {
+            cap.add_css_class("conflict");
+        }
+        inner.append(&cap);
+
+        let rec = gtk4::Button::with_label("Record");
+        rec.add_css_class("ghost");
+        rec.set_valign(gtk4::Align::Center);
+        rec.connect_clicked({
+            let ui = self.clone();
+            move |_| {
+                let mut app = ui.app.borrow_mut();
+                app.recording = Some(Command::OpenLibrary);
+                app.recording_global = true;
+                drop(app);
+                ui.clone().render_all();
+            }
+        });
+        inner.append(&rec);
+
+        row.set_child(Some(&inner));
+        if clash {
+            row.add_css_class("conflict");
+        }
+        row
     }
 
     fn storage_page(self: Rc<Self>, app: &App) -> gtk4::Box {
@@ -1514,12 +1606,20 @@ impl Ui {
                     if key == gdk::Key::Escape {
                         if let Ok(mut a) = ui.app.try_borrow_mut() {
                             a.recording = None;
+                            a.recording_global = false;
                         }
                         ui.clone().render_all();
                         return glib::Propagation::Stop;
                     }
                     if let Some(combo) = ui::combo_from(&key, keycode, &state) {
-                        ui.clone().dispatch(Action::SetBinding(cmd, combo));
+                        // The second global key is a config field, so it is
+                        // recorded through a different action.
+                        let action = if ui.app.try_borrow().map(|a| a.recording_global).unwrap_or(false) {
+                            Action::SetNotesHotkey(combo)
+                        } else {
+                            Action::SetBinding(cmd, combo)
+                        };
+                        ui.clone().dispatch(action);
                         return glib::Propagation::Stop;
                     }
                     return glib::Propagation::Proceed;

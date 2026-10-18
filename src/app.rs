@@ -49,8 +49,16 @@ pub struct App {
     pub last_query: String,
 
     pub recording: Option<Command>,
+    /// Set while recording the second global key, which is a config field and
+    /// not one of the rebindable commands.
+    pub recording_global: bool,
     pub settings_tab: Tab,
     pub conflicts: HashSet<Command>,
+    /// Set when a global trigger has been changed but the compositor is still
+    /// holding the old one. The global key is registered once at startup, so
+    /// until the next run the UI would be showing a shortcut that does not
+    /// work — the UI says so rather than quietly lying.
+    pub trigger_restart_pending: bool,
 
     pub prompt: Option<String>,
     pub confirm_delete: Option<String>,
@@ -85,6 +93,18 @@ impl Hint {
 
     pub fn plain(key: &'static str, label: &'static str) -> Hint {
         Hint { cmd: None, literal: Some(key), label }
+    }
+}
+
+/// The other half of the pair that shares one global key.
+///
+/// `Invoke` and `ToggleOverlay` are two names for the same action, so editing
+/// either has to edit both. Editing one and not the other leaves a binding in
+/// the settings list that nothing ever listens for.
+fn other_global(cmd: Command) -> Command {
+    match cmd {
+        Command::Invoke => Command::ToggleOverlay,
+        _ => Command::Invoke,
     }
 }
 
@@ -132,8 +152,10 @@ impl App {
             selected: 0,
             last_query: String::new(),
             recording: None,
+            recording_global: false,
             settings_tab: Tab::General,
             conflicts,
+            trigger_restart_pending: false,
             prompt: None,
             confirm_delete: None,
             toast: None,
@@ -643,14 +665,36 @@ impl App {
                 });
             }
             Action::SetBinding(cmd, binding) => {
+                self.recording_global = false;
                 self.config.bindings.insert(cmd, binding.clone());
+                // Invoke and ToggleOverlay are two names for the same global
+                // action and deliberately share a key. Setting only one left
+                // the other showing a shortcut that nothing listens for.
+                if matches!(cmd, Command::Invoke | Command::ToggleOverlay) {
+                    self.config
+                        .bindings
+                        .insert(other_global(cmd), binding.clone());
+                    self.trigger_restart_pending = true;
+                }
                 self.recording = None;
                 self.conflicts = self.config.binding_conflicts().into_iter().collect();
                 let _ = self.config.save(&self.config_path);
                 self.toast(format!("{} → {}", cmd.label(), crate::ui::pretty_key(&binding)));
             }
+            Action::SetNotesHotkey(binding) => {
+                self.recording = None;
+                self.recording_global = false;
+                if self.config.notes_hotkey != binding {
+                    self.config.notes_hotkey = binding.clone();
+                    self.trigger_restart_pending = true;
+                    let _ = self.config.save(&self.config_path);
+                    self.toast(format!("My notes → {}", crate::ui::pretty_key(&binding)));
+                }
+            }
             Action::ResetBindings => {
                 self.config.bindings = crate::config::default_bindings();
+                self.config.notes_hotkey = "Meta+Shift+L".to_string();
+                self.trigger_restart_pending = true;
                 self.recording = None;
                 self.conflicts = self.config.binding_conflicts().into_iter().collect();
                 let _ = self.config.save(&self.config_path);
@@ -817,8 +861,10 @@ mod tests {
             selected: 0,
             last_query: String::new(),
             recording: None,
+            recording_global: false,
             settings_tab: Tab::General,
             conflicts: HashSet::new(),
+            trigger_restart_pending: false,
             prompt: None,
             confirm_delete: None,
             toast: None,
@@ -1119,6 +1165,56 @@ mod tests {
         a.dispatch(Action::OpenLibrary);
         a.dispatch(Action::Select(99));
         assert_eq!(a.selected, 0);
+    }
+
+    #[test]
+    fn rebinding_the_invoke_key_rebinds_its_other_name_too() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.dispatch(Action::SetBinding(Command::Invoke, "Ctrl+Alt+N".into()));
+        // Invoke and ToggleOverlay are two names for one global action. Leaving
+        // the other showing the old key meant the settings screen advertised a
+        // shortcut nothing was listening for.
+        assert_eq!(a.config.binding(Command::ToggleOverlay), "Ctrl+Alt+N");
+        assert!(a.conflicts.is_empty(), "the pair is exempt from conflict checks");
+    }
+
+    #[test]
+    fn changing_a_global_key_says_it_needs_a_restart() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        assert!(!a.trigger_restart_pending);
+        a.dispatch(Action::SetBinding(Command::Invoke, "Ctrl+Alt+N".into()));
+        assert!(
+            a.trigger_restart_pending,
+            "the compositor is still holding the old key and the UI must say so"
+        );
+        // It stays set: the compositor is still holding the old global key, and
+        // only a restart clears that. An in-app binding changing meanwhile does
+        // not make the global one real again.
+        a.dispatch(Action::SetBinding(Command::Save, "Ctrl+Shift+S".into()));
+        assert!(a.trigger_restart_pending);
+    }
+
+    #[test]
+    fn the_second_global_key_is_saved_and_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.dispatch(Action::SetNotesHotkey("Ctrl+Alt+L".into()));
+        assert_eq!(a.config.notes_hotkey, "Ctrl+Alt+L");
+        assert!(a.trigger_restart_pending);
+        assert!(a.recording.is_none(), "recording ends when the key is set");
+    }
+
+    #[test]
+    fn resetting_bindings_restores_the_defaults() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.dispatch(Action::SetBinding(Command::Save, "Ctrl+Alt+Q".into()));
+        a.dispatch(Action::SetNotesHotkey("Ctrl+Alt+L".into()));
+        a.dispatch(Action::ResetBindings);
+        assert_eq!(a.config.binding(Command::Save), "Ctrl+S");
+        assert_eq!(a.config.notes_hotkey, "Meta+Shift+L");
     }
 
     #[test]

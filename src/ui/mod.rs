@@ -53,6 +53,8 @@ pub enum Action {
     SetFsync(bool),
     SetUsePortal(bool),
     SetBinding(Command, String),
+    /// The second global key, which is a config field rather than a command.
+    SetNotesHotkey(String),
     ResetBindings,
     ImportNotes,
     ExportNote(String),
@@ -146,6 +148,75 @@ fn is_modifier_keycode(code: u32) -> bool {
     )
 }
 
+/// The evdev code for a key named in our binding syntax.
+///
+/// The inverse of [`key_name_from_keycode`]. Bindings are stored by name and
+/// matched against names read from a hardware keycode, so a binding naming a
+/// key the table cannot produce is a binding that can never fire — which is
+/// exactly the Hebrew-layout failure this whole path exists to avoid.
+pub fn evdev_code_for(name: &str) -> Option<u32> {
+    // The letter codes are not contiguous — a..l run 30..38, then z..m sit at
+    // 44..50 — so this is spelled out rather than computed.
+    const LETTER_CODES: [(char, u32); 26] = [
+        ('Q', 16), ('W', 17), ('E', 18), ('R', 19), ('T', 20), ('Y', 21), ('U', 22),
+        ('I', 23), ('O', 24), ('P', 25), ('A', 30), ('S', 31), ('D', 32), ('F', 33),
+        ('G', 34), ('H', 35), ('J', 36), ('K', 37), ('L', 38), ('Z', 44), ('X', 45),
+        ('C', 46), ('V', 47), ('B', 48), ('N', 49), ('M', 50),
+    ];
+    // Only a one-character name is a letter key. Without the length check,
+    // "Space" matches S and "Escape" matches E.
+    if name.len() == 1 {
+        let first = name.chars().next();
+        if let Some((_, code)) = LETTER_CODES.iter().find(|(l, _)| Some(*l) == first) {
+            return Some(*code);
+        }
+    }
+    if let Some(i) = LETTERS_DIGITS.iter().position(|l| *l == name) {
+        // KEY_1 is 2; KEY_0 is 11.
+        return Some(2 + i as u32);
+    }
+    if let Some(i) = FUNCTION.iter().position(|l| *l == name) {
+        return Some(59 + i as u32);
+    }
+    if let Some(i) = NUMPAD.iter().position(|l| *l == name) {
+        return Some(71 + i as u32);
+    }
+    Some(match name {
+        "Escape" => 1,
+        "Minus" => 12,
+        "Equal" => 13,
+        "Backspace" => 14,
+        "Tab" => 15,
+        "BracketLeft" => 26,
+        "BracketRight" => 27,
+        "Enter" => 28,
+        "Semicolon" => 39,
+        "Apostrophe" => 40,
+        "Grave" => 41,
+        "Backslash" => 43,
+        "Comma" => 51,
+        "Period" => 52,
+        "Slash" => 53,
+        "Space" => 57,
+        "CapsLock" => 58,
+        "NumLock" => 69,
+        // The navigation keys. The name table also answers to a second,
+        // keypad-derived block of codes for these; the ones here are the
+        // evdev codes a keyboard actually reports.
+        "Home" => 102,
+        "Up" => 103,
+        "PageUp" => 104,
+        "Left" => 105,
+        "Right" => 106,
+        "End" => 107,
+        "Down" => 108,
+        "PageDown" => 109,
+        "Insert" => 110,
+        "Delete" => 111,
+        _ => return None,
+    })
+}
+
 pub fn key_name_from_keycode(code: u32) -> Option<&'static str> {
     Some(match code {
         1 => "Escape",
@@ -162,7 +233,10 @@ pub fn key_name_from_keycode(code: u32) -> Option<&'static str> {
         39 => "Semicolon",
         40 => "Apostrophe",
         41 => "Grave",
-        42 => "Backslash",
+        // 42 is KEY_LEFTSHIFT. `is_modifier_keycode` already treats it as a
+        // modifier, so naming it Backslash here both contradicted that check
+        // and made a backslash binding impossible to satisfy.
+        43 => "Backslash",
         44..=50 => return Some(LETTERS[(code - 44 + 19) as usize]), // z..m
         51 => "Comma",
         52 => "Period",
@@ -391,6 +465,46 @@ mod tests {
             combo_from(&Key::Up, 111, &ModifierType::ALT_MASK).as_deref(),
             Some("Alt+Up")
         );
+    }
+
+    #[test]
+    fn every_default_binding_survives_the_hardware_keycode_path() {
+        // A binding is stored by name but matched against a name read from the
+        // hardware keycode. If the table cannot turn that code back into the
+        // key the binding names, the binding can never fire — which is the bug
+        // that made Ctrl+S stop working under a Hebrew layout.
+        for (cmd, binding) in crate::config::default_bindings() {
+            let key = binding.rsplit('+').next().unwrap_or(&binding);
+            let Some(code) = evdev_code_for(key) else {
+                panic!("{cmd:?} = {binding:?}: no evdev code for {key:?}");
+            };
+            assert_eq!(
+                key_name_from_keycode(code),
+                Some(key),
+                "{cmd:?} = {binding:?} would not resolve from keycode {}",
+                x11_to_evdev(x11_to_evdev(code) + 8)
+            );
+            assert!(
+                !is_modifier_keycode(code),
+                "{cmd:?} = {binding:?} is a bare modifier and cannot be bound"
+            );
+        }
+    }
+
+    #[test]
+    fn the_keycode_table_round_trips() {
+        // 75..=106 are the keypad's second and third copies of Insert, End,
+        // Home and the arrows; the names are deliberately shared, so a
+        // round-trip over them would be comparing a name to two codes.
+        for code in (1u32..=74).chain(107u32..=111) {
+            if let Some(name) = key_name_from_keycode(code) {
+                assert_eq!(
+                    evdev_code_for(name),
+                    Some(code),
+                    "{name:?} came from {code} but does not map back to it"
+                );
+            }
+        }
     }
 
     #[test]
