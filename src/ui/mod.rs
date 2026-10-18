@@ -122,6 +122,23 @@ pub fn pretty_key(k: &str) -> String {
 /// expect a shortcut to mean the physical key they pressed.
 ///
 /// Codes are the standard Linux evdev values.
+/// GTK hands us the X11 keycode; Linux tables are written in evdev terms.
+pub fn x11_to_evdev(code: u32) -> u32 {
+    code.saturating_sub(8)
+}
+
+/// Modifier keys, by evdev code. Catches AltGr and the ISO_* spellings that a
+/// keysym check misses.
+fn is_modifier_keycode(code: u32) -> bool {
+    matches!(
+        code,
+        29 | 42 // Control_L, Shift_L
+            | 54 | 56 // Shift_R, Alt_L
+            | 97 | 100 // Ctrl_R, Alt_R
+            | 125 | 126 | 130 // Super_L, Super_R, Menu
+    )
+}
+
 pub fn key_name_from_keycode(code: u32) -> Option<&'static str> {
     Some(match code {
         1 => "Escape",
@@ -244,7 +261,11 @@ pub fn combo_from(
 ) -> Option<String> {
     // Prefer the hardware keycode; fall back to the keysym only when the
     // keycode is not one we know.
-    let name = match key_name_from_keycode(keycode) {
+    //
+    // GTK reports the X11 keycode. On Linux that is the evdev code plus
+    // eight, and reading it as raw evdev shifted every key by eight: `a`
+    // resolved to `L` and Escape matched nothing at all.
+    let name = match key_name_from_keycode(x11_to_evdev(keycode)) {
         Some(n) => n.to_string(),
         None => key_name(key)?,
     };
@@ -264,6 +285,12 @@ pub fn combo_from(
     // A bare modifier press is not a binding. Escape and friends are, so this
     // must test for the modifier keyvals themselves rather than the name's
     // length.
+    // Modifier keys arrive under several spellings depending on layout —
+    // Shift_L, but also ISO_Level3_Shift for AltGr. Identifying them by
+    // hardware code covers every spelling at once.
+    if is_modifier_keycode(x11_to_evdev(keycode)) {
+        return None;
+    }
     if matches!(
         *key,
         gdk::Key::Shift_L
@@ -299,10 +326,12 @@ mod tests {
     #[test]
     fn letter_keys_become_bindings() {
         let m = ModifierType::empty();
-        // evdev code for S is 31.
-        assert_eq!(combo_from(&Key::s, 31, &m).as_deref(), Some("S"));
+        // X11 keycode for S is 39 (evdev 31 + 8). Passing the raw evdev code
+        // used to resolve to a different letter entirely, which is how `A`
+        // became `L` and Escape matched nothing.
+        assert_eq!(combo_from(&Key::s, 39, &m).as_deref(), Some("S"));
         let ctrl = ModifierType::CONTROL_MASK;
-        assert_eq!(combo_from(&Key::s, 31, &ctrl).as_deref(), Some("Ctrl+S"));
+        assert_eq!(combo_from(&Key::s, 39, &ctrl).as_deref(), Some("Ctrl+S"));
     }
 
     #[test]
@@ -310,7 +339,7 @@ mod tests {
         // With the Hebrew layout, GTK reports the S key as hebrew_dalet. A
         // shortcut must still be Ctrl+S, because that is the physical key.
         let ctrl = ModifierType::CONTROL_MASK;
-        let combo = combo_from(&Key::hebrew_dalet, 31, &ctrl);
+        let combo = combo_from(&Key::hebrew_dalet, 31 + 8, &ctrl);
         assert_eq!(combo.as_deref(), Some("Ctrl+S"));
     }
 
@@ -332,7 +361,7 @@ mod tests {
         let m = ModifierType::empty();
         // A bare letter must resolve to the binding's spelling, case
         // included, or New note ("A") and Back never fire.
-        let a = combo_from(&Key::a, 30, &ModifierType::empty());
+        let a = combo_from(&Key::a, 38, &ModifierType::empty());
         assert_eq!(a.as_deref(), Some("A"));
         assert_eq!(
             crate::hotkey::HotkeySpec::parse(a.as_deref().unwrap())
@@ -344,15 +373,15 @@ mod tests {
             "pressing A must match the New note binding"
         );
 
-        assert_eq!(combo_from(&Key::space, 57, &m).as_deref(), Some("Space"));
-        assert_eq!(combo_from(&Key::Escape, 1, &m).as_deref(), Some("Escape"));
+        assert_eq!(combo_from(&Key::space, 65, &m).as_deref(), Some("Space"));
+        assert_eq!(combo_from(&Key::Escape, 9, &m).as_deref(), Some("Escape"));
         // evdev 51 is comma, 103 is Up.
         assert_eq!(
-            combo_from(&Key::comma, 51, &ModifierType::ALT_MASK).as_deref(),
+            combo_from(&Key::comma, 59, &ModifierType::ALT_MASK).as_deref(),
             Some("Alt+Comma")
         );
         assert_eq!(
-            combo_from(&Key::Up, 103, &ModifierType::ALT_MASK).as_deref(),
+            combo_from(&Key::Up, 111, &ModifierType::ALT_MASK).as_deref(),
             Some("Alt+Up")
         );
     }

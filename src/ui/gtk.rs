@@ -16,7 +16,7 @@ use gtk4::glib;
 use crate::app::App;
 use crate::config::{self, Command, FocusLoss};
 use crate::model::Direction;
-use crate::ui::{self, Action, Row, Tab, View};
+use crate::ui::{self, Action, Row, View};
 
 /// Shared between the widget tree and the callbacks, which GTK invokes from
 /// arbitrary signal handlers.
@@ -465,34 +465,14 @@ impl Ui {
     /// trying to hold onto a thought.
     /// Update the editor's status line and counters without touching the tree.
     fn refresh_editor_chrome(self: &Rc<Self>) {
-        let (dirty, touched, text, words, lines, width) = {
+        let (text, words, lines) = {
             let a = self.app.borrow();
             (
-                a.dirty(),
-                a.touched,
                 a.ed_text.len(),
                 a.ed_text.split_whitespace().count(),
                 a.ed_text.lines().count(),
-                0,
             )
         };
-        let _ = width;
-        if let Some(l) = self.editor_status.borrow().as_ref() {
-            let (txt, cls) = if dirty {
-                ("saving\u{2026}", "warn")
-            } else if touched {
-                ("saved", "ok")
-            } else {
-                ("", "ok")
-            };
-            if l.text() != txt {
-                l.set_text(txt);
-            }
-            if !l.has_css_class(cls) {
-                l.remove_css_class(if cls == "warn" { "ok" } else { "warn" });
-                l.add_css_class(cls);
-            }
-        }
         if let Some(l) = self.editor_count.borrow().as_ref() {
             l.set_text(&format!("{text} chars \u{00b7} {words} words \u{00b7} {lines} lines"));
         }
@@ -669,18 +649,8 @@ impl Ui {
         set_direction(&name, app.ed_dir);
         head.append(&name);
 
-        let cached = self.editor_status.borrow_mut().take();
-        let state = match cached {
-            Some(l) => l,
-            None => {
-                let l = gtk4::Label::new(None);
-                l.add_css_class("ok");
-                l
-            }
-        };
-        *self.editor_status.borrow_mut() = Some(state.clone());
-        head.append(&state);
-        self.refresh_editor_chrome();
+        // Deliberately no "saving… / saved" label. The note saves itself; a
+        // status light is one more thing to look at while trying to think.
         col.append(&head);
         col.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
 
@@ -920,7 +890,7 @@ impl Ui {
         self.root.append(&col);
     }
 
-    fn note_row(self: Rc<Self>, app: &App, i: usize, row: &Row, doc: &crate::search::Doc) -> gtk4::Widget {
+    fn note_row(self: Rc<Self>, app: &App, _i: usize, row: &Row, doc: &crate::search::Doc) -> gtk4::Widget {
         let r = gtk4::ListBoxRow::new();
         let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
 
@@ -1493,14 +1463,23 @@ fn set_direction(w: &impl IsA<gtk4::Widget>, dir: Direction) {
 }
 
 /// Which command (if any) the released key combination means.
-/// Append a line to the file named by BATNOTES_KEYLOG, if set. Used to find
-/// out whether key events reach the window at all; off unless asked for.
+/// Append a line to the key log, if it is switched on.
+///
+/// The switch is a marker file rather than an environment variable: on Nix
+/// the process restarts itself with a rebuilt environment, and the variable
+/// was being dropped before it reached the stage that does the logging.
 fn keylog(line: &str) {
-    let Ok(path) = std::env::var("BATNOTES_KEYLOG") else {
+    let Some(dir) = dirs::state_dir() else { return };
+    let dir = dir.join("batnotes");
+    if !dir.join("keylog").exists() {
         return;
-    };
+    }
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("keylog.txt"))
+    {
         let _ = writeln!(f, "{line}");
     }
 }
@@ -1525,22 +1504,24 @@ fn pretty_ago(path: &std::path::Path) -> String {
     }
 }
 
+/// Which command, if any, a key combination names.
+///
+/// Split out from the action mapping so it can be tested against the user's
+/// real configuration without a display.
+pub fn command_for_combo(
+    bindings: &std::collections::BTreeMap<crate::config::Command, String>,
+    combo: &str,
+) -> Option<crate::config::Command> {
+    let norm = crate::hotkey::HotkeySpec::parse(combo).ok()?.normalised();
+    bindings.iter().find_map(|(cmd, binding)| {
+        let b = crate::hotkey::HotkeySpec::parse(binding).ok()?.normalised();
+        (b == norm).then_some(*cmd)
+    })
+}
+
 fn action_for(ui: &Ui, combo: &str) -> Option<Action> {
-    let spec = crate::hotkey::HotkeySpec::parse(combo).ok()?;
-    let norm = spec.normalised();
     let app = ui.app.borrow();
-    let mut found = None;
-    for (cmd, binding) in &app.config.bindings {
-        if crate::hotkey::HotkeySpec::parse(binding)
-            .map(|s| s.normalised())
-            .ok()
-            .as_deref()
-            == Some(norm.as_str())
-        {
-            found = Some(*cmd);
-        }
-    }
-    let cmd = found?;
+    let cmd = command_for_combo(&app.config.bindings, combo)?;
     let has_selection = app.view == View::Library && !app.rows.is_empty();
     Some(match cmd {
         Command::Invoke | Command::ToggleOverlay => Action::Close,
@@ -1573,3 +1554,57 @@ fn action_for(ui: &Ui, combo: &str) -> Option<Action> {
 }
 
 use std::time::Duration;
+#[cfg(test)]
+mod key_tests {
+    use super::command_for_combo;
+    use crate::config::{Command, Config};
+
+    fn resolve(cfg: &Config, combo: &str) -> Option<Command> {
+        command_for_combo(&cfg.bindings, combo)
+    }
+
+    /// Every binding must name a command, round-tripping through the syntax
+    /// the config is written in.
+    #[test]
+    fn every_shipped_binding_resolves() {
+        let cfg = Config::default();
+        for (cmd, binding) in &cfg.bindings {
+            let spec = crate::hotkey::HotkeySpec::parse(binding)
+                .unwrap_or_else(|_| panic!("{binding:?} should parse"));
+            // Invoke and ToggleOverlay deliberately share a binding and both
+            // close the overlay, so either is the right answer here.
+            assert!(
+                resolve(&cfg, &spec.normalised()).is_some(),
+                "{cmd:?} should resolve from {binding:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_essentials_resolve_from_what_gtk_reports_for_those_keys() {
+        let cfg = Config::default();
+        // Escape, New note, Save & close, My notes.
+        assert_eq!(resolve(&cfg, "Escape"), Some(Command::Back));
+        assert_eq!(resolve(&cfg, "A"), Some(Command::NewNote));
+        assert_eq!(resolve(&cfg, "Ctrl+Enter"), Some(Command::SaveClose));
+        assert_eq!(resolve(&cfg, "Ctrl+S"), Some(Command::Save));
+        assert!(resolve(&cfg, "B").is_some(), "B reaches the library");
+    }
+
+    #[test]
+    fn the_live_user_config_resolves() {
+        let path = crate::config::config_path();
+        let Ok(loaded) = Config::load(&path) else {
+            return;
+        };
+        let cfg = loaded.config;
+        for (cmd, binding) in &cfg.bindings {
+            let spec = crate::hotkey::HotkeySpec::parse(binding)
+                .unwrap_or_else(|_| panic!("{binding:?} should parse"));
+            // Invoke and ToggleOverlay deliberately share a binding and both
+            // close the overlay, so the first match is the correct answer.
+            let got = resolve(&cfg, &spec.normalised());
+            assert!(got.is_some(), "{cmd:?} should resolve from {binding:?}");
+        }
+    }
+}
