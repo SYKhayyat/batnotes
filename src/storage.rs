@@ -97,13 +97,20 @@ impl Storage {
     }
 
     fn read_direction(&self, note_path: &Path) -> Direction {
-        fs::read_to_string(self.sidecar_path(note_path))
+        if let Some(d) = fs::read_to_string(self.sidecar_path(note_path))
             .ok()
             .and_then(|s| match s.trim() {
                 "ltr" => Some(Direction::Ltr),
                 "rtl" => Some(Direction::Rtl),
                 _ => None,
             })
+        {
+            return d;
+        }
+        // No sidecar: an import, or a file someone dropped in. Read the text
+        // and let it say which direction it runs in.
+        fs::read_to_string(note_path)
+            .map(|c| crate::model::infer_direction(&c))
             .unwrap_or_default()
     }
 

@@ -144,6 +144,36 @@ with a hand-built shadow**, not a translucent blur. This is the one visual
 item from the design references that is not achievable without a compositor
 protocol.
 
+### 6.1 The app owns every colour, including a dark palette
+
+On a dark desktop session (KDE with `breeze-dark`) GTK hands the application the
+*dark* variant of the theme, so anything the app did not style came back in the
+desktop's colours. The notes list was unstyled and rendered near-black — dark
+green Hebrew on `#242424` — inside an otherwise cream window.
+
+The stylesheet now names every widget the app uses: `list`, `entry`,
+`textview` *and its inner `text` node*, `scrolledwindow`, `undershoot`,
+`separator`, `switch` and `scrollbar`. The `textview > text` node is the one
+that matters most: styling only the `textview` leaves the writing surface to
+the theme.
+
+`config.theme` picks the palette (`light` or `dark`, default `light`) and
+Settings → General switches it. It is deliberately independent of the desktop
+setting — the window looks the same either way. In dark mode the accent is a
+pale green, so ink drawn on top of it flips to dark.
+
+### 6.2 Labels have to be centred, or they become tall empty pills
+
+A `GtkLabel` stretches to the height of the box it is in. Every keycap, the
+chooser's icon tile and the Record buttons therefore rendered as 40–50px tall
+empty rectangles. They are centred at construction time, in `keycap()`, so
+every call site inherits the fix.
+
+The ruled-paper gradient behind the editor is gone. It was a fixed 35px
+`repeating-linear-gradient` while the real line height is about 20px, so the
+rules drifted away from the text — by the fifth line no rule sat near the
+baseline at all.
+
 ## 7. Layout
 
 ```
@@ -160,11 +190,76 @@ src/
   main.rs      startup, viewport, single instance
 ```
 
+## 7.1 What the library actually does now
+
+The list was a picture of your notes rather than a way into them. Nothing in the
+GTK layer dispatched `OpenNote`, `Select` or `Move`, so clicking a row did
+nothing, `app.selected` never moved, the footer's Delete always targeted the
+first note, and the ↑/↓ buttons moved an index that nothing displayed.
+`ReorderFocus` only changed `selected` and never called `move_note`, so
+reordering was unreachable even from the keyboard.
+
+It now follows the plainest model: click or Enter opens, arrows move the
+selection, Alt+arrows reorder. Arrow keys and Enter are GTK's own listbox
+behaviour; the bindings map to `Action::MoveSelected`.
+
+`resync_rows` replaces `recompute_rows` for everything except changing the
+query. `recompute_rows` resets a filtered list to every note, so reordering,
+saving and deleting each turned a search back into the full library.
+
+The footer legend used to read "Del delete" and "Ctrl , settings": a key
+pasted into the label text, where the reader cannot tell the action from its
+shortcut. Action buttons now carry a separate key chip, and the legend only
+lists bindings that have no button — which is why it is now one or two items
+instead of eight.
+
+## 7.2 Settings had one tab, not three
+
+`build_settings` rendered the General page and nothing else. `keys_page` and
+`storage_page` existed and were unreachable, so key remapping, the notes
+directory, index rebuild and "open folder" were all absent from the UI — and so
+was the global-hotkey status, which is the one place that tells you KDE never
+actually granted the key. All three tabs are reachable now, and the segmented
+controls replaced `Stack` widgets that displayed only the option already in
+effect.
+
+## 7.3 Direction without a sidecar
+
+`Direction::default()` is `Rtl`, so any note with no `.dir` sidecar — an
+import, or a file dropped into the folder by hand — was laid out
+right-to-left. English notes rendered mirrored, and the chooser's "N Hebrew"
+count counted them. `model::infer_direction` reads the first strongly
+directional character instead. The sidecar still wins when it exists.
+
+Per-row direction in the list is applied to the note's **text block**, not to
+the row: the title, preview and timestamp take the note's alignment, while the
+list order, scrollbar and delete button stay put so the list still reads as
+one list.
+
+## 7.4 Errors and warnings that nothing displayed
+
+`App::storage_error` and `App::config_warning` were written by the state machine
+and read by no widget, so a failed save was indistinguishable from a successful
+one. Both are now banners above the view, with a dismiss action. A save error
+also stops the overlay closing, because closing implies it was captured.
+
+## 7.5 Two smaller ones
+
+* `Ui::signature` fingerprinted `rows.len()` but not the query, so searching
+  for something with three hits and then something else with three hits left
+  the first results on screen. It now includes the query, the selection, the
+  settings tab and the notice state.
+* A signal fired *during* a rebuild (the search box's own `set_text`) started a
+  second rebuild inside the first, and the two fought over the same widgets —
+  GTK rejected the appends and the view came out half built. Rebuilds are now
+  non-reentrant, and the search handler ignores a value it already has.
+
 ## 8. Tests
 
-`cargo test` — 48 unit tests covering storage atomicity and sidecars, manifest
+`cargo test` — 64 unit tests covering storage atomicity and sidecars, manifest
 reconciliation, search ranking and the 10k budget, binding parsing and
-conflict detection, corrupt-config backup, and id uniqueness.
+conflict detection, corrupt-config backup, id uniqueness, direction inference,
+reorder persistence, and a filtered list surviving a save.
 
 ## 9. Portability
 

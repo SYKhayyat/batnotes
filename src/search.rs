@@ -104,6 +104,22 @@ impl Indexed {
         }
     }
 
+    /// Everything after the title line.
+    ///
+    /// A row shows the title as its heading, so a preview that starts at line
+    /// one prints the title a second time directly underneath it.
+    pub fn preview_body(&self, id: &str, lines: usize) -> String {
+        let Some(d) = self.get(id) else { return String::new() };
+        let rest = match d.content.lines().find(|l| !l.trim().is_empty()) {
+            Some(first) => {
+                let at = first.as_ptr() as usize - d.content.as_ptr() as usize;
+                &d.content[at + first.len()..]
+            }
+            None => "",
+        };
+        preview_of(rest, lines)
+    }
+
     /// A window of the body around the match, so the user can see *why* a note
     /// matched instead of an identical preview for every result.
     pub fn snippet(&self, id: &str, at: usize, before: usize, after: usize) -> String {
@@ -225,7 +241,7 @@ mod tests {
             items
                 .iter()
                 .enumerate()
-                .map(|(i, (id, c))| {
+                .map(|(_i, (id, c))| {
                     Doc::new(
                         id.to_string(),
                         PathBuf::from(format!("/n/{id}.txt")),

@@ -68,6 +68,26 @@ pub struct App {
     pub closing: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Hint {
+    /// Set when the key comes from a rebindable command.
+    pub cmd: Option<Command>,
+    /// Set when the key is not a command at all — Enter in the list, or the
+    /// arrow keys GTK handles on its own.
+    pub literal: Option<&'static str>,
+    pub label: &'static str,
+}
+
+impl Hint {
+    pub fn key(cmd: Command, label: &'static str) -> Hint {
+        Hint { cmd: Some(cmd), literal: None, label }
+    }
+
+    pub fn plain(key: &'static str, label: &'static str) -> Hint {
+        Hint { cmd: None, literal: Some(key), label }
+    }
+}
+
 impl App {
     pub fn new() -> Result<App> {
         let config_path = crate::config::config_path();
@@ -151,7 +171,7 @@ impl App {
         self.order = order;
         self.total_bytes = bytes;
         self.searcher.rebuild(self.index.clone());
-        self.recompute_rows();
+        self.resync_rows();
     }
 
     pub fn dirty(&self) -> bool {
@@ -186,6 +206,26 @@ impl App {
                 .map(|id| Row { id, at: None })
                 .collect();
         }
+        if self.selected >= self.rows.len() {
+            self.selected = self.rows.len().saturating_sub(1);
+        }
+    }
+
+    /// Re-derive the visible rows from the current order *without* throwing a
+    /// filtered list away.
+    ///
+    /// `recompute_rows` resets a search back to every note, which is right when
+    /// the query itself is changing and wrong for everything else: reordering,
+    /// saving and deleting all call it, and each of those used to make a search
+    /// silently become the full list.
+    fn resync_rows(&mut self) {
+        if self.query.trim().is_empty() {
+            self.recompute_rows();
+            return;
+        }
+        let mut rows = std::mem::take(&mut self.rows);
+        rows.sort_by_key(|r| self.order.iter().position(|id| *id == r.id).unwrap_or(usize::MAX));
+        self.rows = rows;
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
         }
@@ -469,15 +509,11 @@ impl App {
         let v = self.order.remove(i);
         self.order.insert(j, v);
         let _ = self.storage.write_order(&self.order);
+        // The visible list has to follow the new order, or the arrows appear to
+        // do nothing until the overlay is reopened.
+        self.resync_rows();
+        self.selected = self.rows.iter().position(|r| r.id == id).unwrap_or(self.selected);
         self.toast("Order saved");
-        self.selected = j;
-    }
-
-    pub fn move_selected(&mut self, delta: i32) {
-        if let Some(row) = self.rows.get(self.selected) {
-            let id = row.id.clone();
-            self.move_note(&id, delta);
-        }
     }
 
     pub fn open_selected(&mut self) {
@@ -544,22 +580,33 @@ impl App {
             Action::ConfirmDelete(id) => self.confirm_delete = Some(id),
             Action::DismissConfirm => self.confirm_delete = None,
             Action::Move(id, d) => self.move_note(&id, d),
-            Action::ReorderFocus(d) => {
-                if !self.rows.is_empty() {
-                    self.selected =
-                        (self.selected as i32 + d).clamp(0, self.rows.len() as i32 - 1) as usize;
+            Action::MoveSelected(d) => {
+                let id = self.rows.get(self.selected).map(|r| r.id.clone());
+                if let Some(id) = id {
+                    self.move_note(&id, d);
                 }
             }
-            Action::Select(i) => self.selected = i,
+            Action::Select(i) => {
+                if i < self.rows.len() {
+                    self.selected = i;
+                }
+            }
+            Action::FocusSearch => {}
             Action::SetQuery(q) => {
                 if q != self.query {
                     self.query = q.clone();
                     self.last_query = q;
                     self.searcher.submit(self.index.clone(), &self.query);
                     self.selected = 0;
-                    self.recompute_rows();
+                    // Deliberately *not* recompute_rows: the previous results
+                    // stay on screen until the worker answers, so the list does
+                    // not flash the entire library on every keystroke.
+                    if self.query.trim().is_empty() {
+                        self.recompute_rows();
+                    }
                 }
             }
+            Action::SelectTab(t) => self.settings_tab = t,
             Action::SetDirection(d) => {
                 self.ed_dir = d;
             }
@@ -567,8 +614,12 @@ impl App {
                 self.config.default_direction = d;
                 let _ = self.config.save(&self.config_path);
             }
+            Action::SetTheme(t) => {
+                self.config.theme = t;
+                let _ = self.config.save(&self.config_path);
+            }
             Action::SetPreviewLines(n) => {
-                self.config.preview_lines = n;
+                self.config.preview_lines = n.clamp(1, 8);
                 let _ = self.config.save(&self.config_path);
             }
             Action::SetFocusLoss(f) => {
@@ -612,6 +663,9 @@ impl App {
             }
             Action::DismissToast => self.toast = None,
             Action::DismissWarning => self.config_warning = None,
+            // A failed save has to stay on screen until it is acknowledged:
+            // silently swallowing it is how a note looks captured and is not.
+            Action::DismissError => self.storage_error = None,
             Action::DismissPrompt => self.prompt = None,
             Action::PromptAction(id) => match id.as_str() {
                 ui::PROMPT_SAVE_CLOSE => {
@@ -696,27 +750,29 @@ impl App {
         }
     }
 
-    pub fn hints(&self) -> Vec<(Command, &'static str)> {
-        let mut v: Vec<(Command, &'static str)> = vec![];
+    /// Bindings that are worth spelling out in the current view.
+    ///
+    /// Every other action already carries its key on the button that performs
+    /// it, so listing those again just fills the footer with "Del delete" and
+    /// "Ctrl , settings". What belongs here is what the buttons cannot say:
+    /// shortcuts with no button behind them.
+    pub fn hints(&self) -> Vec<Hint> {
+        let mut v: Vec<Hint> = vec![];
         match self.view {
             View::Chooser => {
-                v.push((Command::NewNote, "new note"));
-                v.push((Command::OpenLibrary, "my notes"));
+                // Both destinations are on screen with their keys attached.
             }
             View::Editor => {
-                v.push((Command::Save, "save"));
-                v.push((Command::SaveClose, "save & close"));
-                v.push((Command::ShowLibrary, "notes"));
-                v.push((Command::ToggleDirection, "RTL/LTR"));
+                // Ctrl+S saves without closing; the button is save *and* close.
+                v.push(Hint::key(Command::Save, "save, stay here"));
             }
             View::Library => {
-                v.push((Command::MoveUp, "move up"));
-                v.push((Command::OpenLibrary, "back"));
+                v.push(Hint::key(Command::FocusSearch, "search"));
+                v.push(Hint::plain("Enter", "open"));
+                v.push(Hint::plain("↑ ↓", "move selection"));
             }
             View::Settings => {}
         }
-        v.push((Command::Settings, "settings"));
-        v.push((Command::Back, "close"));
         v
     }
 }
@@ -991,14 +1047,95 @@ mod tests {
     }
 
     #[test]
+    fn reordering_moves_the_note_and_keeps_it_selected() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        for body in ["first", "second", "third"] {
+            a.new_draft();
+            a.ed_text = body.into();
+            a.save(false);
+        }
+        // Newest first, so the order is third, second, first.
+        assert_eq!(a.order.len(), 3);
+        a.dispatch(Action::OpenLibrary);
+        assert_eq!(a.rows.len(), 3);
+        let last = a.rows[a.rows.len() - 1].id.clone();
+        a.dispatch(Action::Select(2));
+        a.dispatch(Action::MoveSelected(-1));
+        assert_eq!(a.rows[1].id, last, "the note actually changed place");
+        assert_eq!(a.selected, 1, "and stayed selected so it can be moved again");
+    }
+
+    #[test]
+    fn reordering_persists_across_a_reload() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        for body in ["one", "two"] {
+            a.new_draft();
+            a.ed_text = body.into();
+            a.save(false);
+        }
+        let moved = a.order[1].clone();
+        a.dispatch(Action::Select(1));
+        a.dispatch(Action::MoveSelected(-1));
+        assert_eq!(a.order.first(), Some(&moved), "the note moved to the front");
+        // refresh() is what the app does on the next visit: it re-reads the
+        // manifest from disk, so the order has to have been written.
+        a.refresh();
+        assert_eq!(a.order.first(), Some(&moved));
+    }
+
+    #[test]
+    fn a_search_survives_a_save_instead_of_becoming_the_full_list() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        for body in ["shopping list", "meeting notes"] {
+            a.new_draft();
+            a.ed_text = body.into();
+            a.save(false);
+        }
+        a.dispatch(Action::OpenLibrary);
+        a.dispatch(Action::SetQuery("shopping".into()));
+        // The worker is asynchronous; ask for the same thing it would deliver.
+        a.apply_hits(a.index.search("shopping"));
+        assert_eq!(a.rows.len(), 1);
+
+        a.new_draft();
+        a.ed_text = "shopping again".into();
+        a.save(false);
+        assert!(
+            a.rows.len() <= 2,
+            "saving must not silently replace the filtered list with everything"
+        );
+    }
+
+    #[test]
+    fn selecting_past_the_end_of_the_list_is_ignored() {
+        let d = tempfile::tempdir().unwrap();
+        let mut a = test_app(d.path());
+        a.new_draft();
+        a.ed_text = "only note".into();
+        a.save(false);
+        a.dispatch(Action::OpenLibrary);
+        a.dispatch(Action::Select(99));
+        assert_eq!(a.selected, 0);
+    }
+
+    #[test]
     fn hints_are_live_for_the_current_view() {
         let d = tempfile::tempdir().unwrap();
         let mut a = test_app(d.path());
         a.show();
-        assert!(a.hints().iter().any(|(c, _)| *c == Command::NewNote));
+        // The chooser puts both destinations on screen with their keys, so it
+        // has nothing to add in a legend.
+        assert!(a.hints().is_empty());
         a.dispatch(Action::NewNote);
-        assert!(a.hints().iter().any(|(c, _)| *c == Command::Save));
+        assert!(a.hints().iter().any(|h| h.cmd == Some(Command::Save)));
         a.dispatch(Action::OpenLibrary);
-        assert!(a.hints().iter().any(|(c, _)| *c == Command::MoveUp));
+        assert!(a.hints().iter().any(|h| h.cmd == Some(Command::FocusSearch)));
+        assert!(
+            a.hints().iter().any(|h| h.literal == Some("Enter")),
+            "the list must say that Enter opens a note"
+        );
     }
 }

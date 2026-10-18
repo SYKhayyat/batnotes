@@ -37,11 +37,15 @@ pub enum Action {
     ConfirmDeleteAccepted(String),
     DismissConfirm,
     Move(String, i32),
-    ReorderFocus(i32),
+    /// Move the note under the selection up or down and keep it selected.
+    MoveSelected(i32),
     Select(usize),
     SetQuery(String),
+    /// Put the caret in the library's search box.
+    FocusSearch,
     SetDirection(crate::model::Direction),
     SetDefaultDirection(crate::model::Direction),
+    SetTheme(crate::config::Theme),
     SetKeepAbove(bool),
     DeleteFocused,
     SetPreviewLines(usize),
@@ -55,10 +59,12 @@ pub enum Action {
     RebuildIndex,
     DismissToast,
     DismissWarning,
+    DismissError,
     DismissPrompt,
     PromptAction(String),
     OpenNotesDir,
     ApplyHotkey,
+    SelectTab(Tab),
 }
 
 /// One line of the library list.

@@ -41,9 +41,16 @@ pub struct Ui {
     /// dropped focus, and the focus-out handler read it as "the user left".
     /// The editor is worse — it was destroyed on every keystroke.
     editor_view: RefCell<Option<gtk4::TextView>>,
-    editor_status: RefCell<Option<gtk4::Label>>,
     editor_count: RefCell<Option<gtk4::Label>>,
     search_entry: RefCell<Option<gtk4::SearchEntry>>,
+    /// Set while the UI is writing the selection back into the list, so the
+    /// listbox's own change signal is not read as the user picking a row.
+    syncing_selection: RefCell<bool>,
+    /// True while the widget tree is being rebuilt. A signal fired by a
+    /// rebuild (setting the search box's text, for instance) used to start a
+    /// second rebuild inside the first one, and the two then fought over the
+    /// same widgets: GTK rejected the appends and the view came out half built.
+    building: RefCell<bool>,
     /// Set while we are deliberately taking focus, so the focus-out handler
     /// does not mistake it for the user clicking away.
     refocus: RefCell<bool>,
@@ -61,9 +68,10 @@ pub fn build(app: App, window: gtk4::Window) -> Rc<Ui> {
         rendered: RefCell::new(String::new()),
         current_view: RefCell::new(View::Library),
         editor_view: RefCell::new(None),
-        editor_status: RefCell::new(None),
         editor_count: RefCell::new(None),
         search_entry: RefCell::new(None),
+        syncing_selection: RefCell::new(false),
+        building: RefCell::new(false),
         refocus: RefCell::new(false),
     });
     let rc2 = rc.clone();
@@ -194,10 +202,14 @@ impl Ui {
     /// so a keystroke changes nothing structural — but counting characters
     /// here meant every single keystroke rebuilt the entire tree, which is
     /// exactly what made the window blink while typing.
+    ///
+    /// The query has to be in here. Folding the list down to `rows.len()`
+    /// meant that searching for something with three hits and then something
+    /// else with three hits left the first result set on screen for ever.
     fn signature(&self) -> String {
         let a = self.app.borrow();
         format!(
-            "{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}",
+            "{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}|{}|{:?}|{}",
             a.view,
             a.ed_id,
             a.ed_dir == Direction::Rtl,
@@ -205,21 +217,47 @@ impl Ui {
             a.prompt,
             a.confirm_delete,
             a.recording,
+            a.query,
+            a.selected,
+            a.settings_tab,
+            a.config_warning,
+            a.config.theme == config::Theme::Dark,
+            a.storage_error.is_some(),
+            a.ed_id.is_none(),
         )
     }
 
     fn rebuild(self: &Rc<Self>) {
+        if *self.building.borrow() {
+            return;
+        }
+        *self.building.borrow_mut() = true;
+        self.rebuild_inner();
+        *self.building.borrow_mut() = false;
+    }
+
+    fn rebuild_inner(self: &Rc<Self>) {
         while let Some(c) = self.root.first_child() {
             self.root.remove(&c);
         }
         let app = self.app.borrow();
         let app_view = app.view;
         let confirm_id = app.confirm_delete.clone();
-        // Capture stays bare. The list and settings can afford a key legend.
-        let show_hints = matches!(app.view, View::Library | View::Settings);
+        let warning = app.config_warning.clone();
+        let error = app.storage_error.clone();
         if *self.current_view.borrow() != app.view {
             *self.current_view.borrow_mut() = app.view;
             self.apply_size(app.view);
+        }
+        // Something went wrong and the user has to be told before anything
+        // else. Both of these were written by the app and read by nothing.
+        if let Some(e) = &error {
+            let ui = self.clone();
+            self.root.append(&ui.notice(e, "banner-danger", Action::DismissError));
+        }
+        if let Some(w) = &warning {
+            let ui = self.clone();
+            self.root.append(&ui.notice(w, "banner-warn", Action::DismissWarning));
         }
         match app.view {
             View::Chooser => self.build_chooser(&app),
@@ -232,10 +270,8 @@ impl Ui {
             self.root.append(&ui.prompt_bar(p));
         }
         drop(app);
-
-        if show_hints {
-            self.root.append(&self.clone().hints_bar());
-        }
+        let hb = self.clone().hints_bar();
+        self.root.append(&hb);
         if self.last_toast.borrow().is_some() {
             self.root.append(&self.toast.clone());
         }
@@ -280,6 +316,9 @@ impl Ui {
     /// into a message instead of a dead daemon.
     fn dispatch(self: Rc<Self>, a: Action) {
         let this = self.clone();
+        // Some actions are about focus, not state, and have to run after the
+        // tree that holds the widget has been built.
+        let wants_focus = matches!(a, Action::FocusSearch);
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             // A signal can fire this while a borrow is already held; the
             // action is simply dropped rather than aborting the daemon.
@@ -295,54 +334,83 @@ impl Ui {
             // boundary aborts the process rather than unwinding — which turns
             // a cosmetic fault into a dead daemon.
             eprintln!("batnotes: a widget handler panicked; recovered");
+            return;
+        }
+        if wants_focus {
+            if let Some(e) = self.search_entry.borrow().as_ref() {
+                *self.refocus.borrow_mut() = true;
+                e.grab_focus();
+            }
         }
     }
 
     // ---- chrome ----------------------------------------------------------
 
-    fn header(self: Rc<Self>, subtitle: String) -> gtk4::Box {
+    /// A dismissible message. Errors and warnings used to be recorded in the
+    /// app state and then never drawn, which made a failed save look exactly
+    /// like a successful one.
+    fn notice(self: Rc<Self>, text: &str, style: &str, dismiss: Action) -> gtk4::Box {
         let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let left = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        left.append(&gtk4::Label::builder().label("batnotes").css_classes(["brand"]).build());
-        bar.append(&left);
-
-        let sub = gtk4::Label::builder()
-            .label(&subtitle)
-            .css_classes(["subtitle"])
-            .hexpand(true)
-            .xalign(0.0)
-            .build();
-        bar.append(&sub);
-
-        let settings = gtk4::Button::with_label("⚙");
-        settings.add_css_class("flat");
-        settings.set_tooltip_text(Some("Settings"));
-        settings.connect_clicked({
+        bar.add_css_class("notice");
+        bar.add_css_class(style);
+        let l = gtk4::Label::new(Some(text));
+        l.add_css_class("notice-text");
+        l.set_wrap(true);
+        l.set_xalign(0.0);
+        l.set_hexpand(true);
+        bar.append(&l);
+        let x = gtk4::Button::with_label("\u{2715}");
+        x.add_css_class("flat");
+        x.set_valign(gtk4::Align::Start);
+        x.set_tooltip_text(Some("Dismiss"));
+        x.connect_clicked({
             let ui = self.clone();
-            move |_| ui.clone().dispatch(Action::OpenSettings)
+            move |_| ui.clone().dispatch(dismiss.clone())
         });
-        bar.append(&settings);
-
-        let close = gtk4::Button::with_label("✕");
-        close.add_css_class("flat");
-        close.set_tooltip_text(Some("Close"));
-        close.connect_clicked({
-            let ui = self.clone();
-            move |_| ui.clone().dispatch(Action::Close)
-        });
-        bar.append(&close);
+        bar.append(&x);
         bar
+    }
+
+    /// A button whose label carries its own key binding as a separate chip.
+    ///
+    /// Pasting the key into the label text produced things like "Delete Del"
+    /// and "⚙ Ctrl ," — the reader cannot tell the action from its shortcut.
+    fn key_button(self: &Rc<Self>, text: &str, cmd: Command, style: &str) -> gtk4::Button {
+        let app = self.app.borrow();
+        let key = ui::pretty_key(&app.config.binding(cmd));
+        drop(app);
+        let b = gtk4::Button::new();
+        b.add_css_class(style);
+        let inner = gtk4::Box::new(gtk4::Orientation::Horizontal, 7);
+        let l = gtk4::Label::new(Some(text));
+        l.add_css_class("btn-text");
+        inner.append(&l);
+        inner.append(&keycap(&key));
+        b.set_child(Some(&inner));
+        b
     }
 
     fn hints_bar(self: Rc<Self>) -> gtk4::Box {
         let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 14);
         bar.add_css_class("hintbar");
         let app = self.app.borrow();
-        for (cmd, label) in app.hints() {
-            let b = keycap(&app.config.binding(cmd));
+        let hints = app.hints();
+        if hints.is_empty() {
+            // Nothing worth saying: an empty bordered strip at the bottom of
+            // the window is worse than no strip at all.
+            bar.add_css_class("hintbar-empty");
+        }
+        for hint in hints {
+            let key = match (hint.cmd, hint.literal) {
+                (Some(cmd), _) => app.config.binding(cmd),
+                (None, Some(k)) => k.to_string(),
+                _ => continue,
+            };
+            let b = keycap(&key);
             bar.append(&b);
-            let l = gtk4::Label::new(Some(label));
+            let l = gtk4::Label::new(Some(hint.label));
             l.add_css_class("hintlabel");
+            l.set_valign(gtk4::Align::Center);
             bar.append(&l);
         }
         bar
@@ -490,8 +558,7 @@ impl Ui {
         let key = |c: Command| ui::pretty_key(&app.config.binding(c));
 
         if show_back {
-            let back = gtk4::Button::with_label(&format!("\u{2190}  Back  {}", key(Command::Back)));
-            back.add_css_class("ghost");
+            let back = self.key_button("\u{2190}  Back", Command::Back, "ghost");
             back.set_tooltip_text(Some("Return to the previous view"));
             back.connect_clicked({
                 let ui = self.clone();
@@ -507,9 +574,15 @@ impl Ui {
         name.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
         bar.append(&name);
 
-        let settings = gtk4::Button::with_label(&format!("\u{2699}  {}", key(Command::Settings)));
-        settings.add_css_class("ghost");
-        settings.set_tooltip_text(Some("Settings"));
+        // The gear is an icon, not a sentence. Its binding goes in the
+        // tooltip; the hint bar already spells it out along the bottom.
+        let settings = gtk4::Button::with_label("\u{2699}");
+        settings.add_css_class("flat");
+        settings.set_valign(gtk4::Align::Center);
+        settings.set_tooltip_text(Some(&format!(
+            "Settings ({})",
+            key(Command::Settings)
+        )));
         settings.connect_clicked({
             let ui = self.clone();
             move |_| ui.clone().dispatch(Action::OpenSettings)
@@ -518,6 +591,7 @@ impl Ui {
 
         let close = gtk4::Button::with_label("\u{2715}");
         close.add_css_class("flat");
+        close.set_valign(gtk4::Align::Center);
         close.set_tooltip_text(Some(&format!("Close ({})", key(Command::Invoke))));
         close.connect_clicked({
             let ui = self.clone();
@@ -645,9 +719,13 @@ impl Ui {
         row.add_css_class("choice-row");
 
         let box_ = gtk4::Box::new(gtk4::Orientation::Horizontal, 16);
+        let icon_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        icon_box.add_css_class("choice-icon");
+        icon_box.set_valign(gtk4::Align::Center);
         let ic = gtk4::Label::new(Some(icon));
-        ic.add_css_class("choice-icon");
-        box_.append(&ic);
+        ic.add_css_class("choice-glyph");
+        icon_box.append(&ic);
+        box_.append(&icon_box);
 
         let texts = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
         let t = gtk4::Label::new(Some(title));
@@ -661,12 +739,13 @@ impl Ui {
         texts.append(&d);
         box_.append(&texts);
 
-        let kbd = gtk4::Label::new(Some(key));
-        kbd.add_css_class("kbd");
+        let kbd = keycap(key);
+        kbd.set_valign(gtk4::Align::Center);
         box_.append(&kbd);
 
         let arrow = gtk4::Label::new(Some("\u{2192}"));
         arrow.add_css_class("choice-arrow");
+        arrow.set_valign(gtk4::Align::Center);
         box_.append(&arrow);
 
         row.set_child(Some(&box_));
@@ -679,8 +758,11 @@ impl Ui {
 
     fn build_editor(self: &Rc<Self>, app: &App) {
         let col = self.page();
+        col.set_spacing(6);
 
-        let head = self.chrome(app, "batnotes", true);
+        col.append(&self.chrome(app, "batnotes", true));
+        col.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
         // The title, not the filename. The id is opaque and meaningless to a
         // person; in the list it read as noise.
         let label: String = match &app.ed_id {
@@ -691,20 +773,15 @@ impl Ui {
                 .unwrap_or_else(|| "Note".to_string()),
             None => "New note".to_string(),
         };
-        col.append(&head);
-
         let name = gtk4::Label::new(Some(&label));
         name.add_css_class("section-title");
         name.set_xalign(0.0);
         name.set_hexpand(true);
         name.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
-        set_direction(&name, app.ed_dir);
         col.append(&name);
 
-        // Deliberately no "saving… / saved" label. The note saves itself; a
-        // status light is one more thing to look at while trying to think.
-        col.append(&head);
-        col.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+        // The header used to be appended here as well, so the editor rendered
+        // two identical chrome bars with a separator between them.
 
         // Reuse the live TextView. A new one per keystroke destroyed the
         // buffer the user was typing into and lost the caret every character.
@@ -773,22 +850,44 @@ impl Ui {
         foot.append(&count);
 
         // Every action reachable by button as well as by key.
-        let notes = gtk4::Button::with_label(&format!(
-            "\u{25a6}  My notes  {}",
-            ui::pretty_key(&app.config.binding(Command::ShowLibrary))
-        ));
-        notes.add_css_class("ghost");
+        let notes = self.key_button("\u{25a6}  My notes", Command::ShowLibrary, "ghost");
         notes.connect_clicked({
             let ui = self.clone();
             move |_| ui.clone().dispatch(Action::ShowLibrary)
         });
         foot.append(&notes);
 
-        let save = gtk4::Button::with_label(&format!(
-            "Save  {}",
-            ui::pretty_key(&app.config.binding(Command::SaveClose))
-        ));
-        save.add_css_class("primary");
+        // Direction was only ever reachable through a keyboard shortcut that
+        // nothing on screen mentioned. SRS F7 asks for it to be selectable,
+        // and for a Hebrew note the difference is the whole layout.
+        let dir_label = if app.ed_dir == Direction::Rtl {
+            "\u{202b} RTL"
+        } else {
+            "\u{202a} LTR"
+        };
+        let dir = self.key_button(dir_label, Command::ToggleDirection, "ghost");
+        dir.set_tooltip_text(Some("Switch the base writing direction"));
+        dir.connect_clicked({
+            let ui = self.clone();
+            move |_| {
+                let next = ui.app.borrow().ed_dir.other();
+                ui.clone().dispatch(Action::SetDirection(next));
+            }
+        });
+        foot.append(&dir);
+
+        // Delete is here as well as on the row, so a note can be removed from
+        // where it is being read.
+        if let Some(id) = app.ed_id.clone() {
+            let del = self.key_button("Delete", Command::DeleteNote, "ghost");
+            del.connect_clicked({
+                let ui = self.clone();
+                move |_| ui.clone().dispatch(Action::ConfirmDelete(id.clone()))
+            });
+            foot.append(&del);
+        }
+
+        let save = self.key_button("Save", Command::SaveClose, "primary");
         save.connect_clicked({
             let ui = self.clone();
             move |_| ui.clone().dispatch(Action::Save { close: true })
@@ -801,22 +900,13 @@ impl Ui {
         view.grab_focus();
     }
 
-    fn stats(&self, app: &App) -> String {
-        format!(
-            "{} chars · {} words · {} lines",
-            app.ed_text.chars().count(),
-            app.ed_text.split_whitespace().count(),
-            app.ed_text.lines().count().max(1)
-        )
-    }
-
     // ---- library -------------------------------------------------------------
 
     fn build_library(self: &Rc<Self>, app: &App) {
         let col = self.page();
         col.set_spacing(8);
-
-        col.append(&self.chrome(app, "batnotes", true));
+        let ch = self.chrome(app, "batnotes", true);
+        col.append(&ch);
 
         let h = gtk4::Label::new(Some("My notes"));
         h.add_css_class("display");
@@ -829,18 +919,19 @@ impl Ui {
         )));
         count.add_css_class("lede");
         count.set_xalign(0.0);
-        col.append(&count);
 
-        // Adding from the list: the review flow is also a place you notice
-        // you need another note, and there is no capture key to hand.
-        let add = gtk4::Button::with_label("+  New note");
-        add.add_css_class("primary");
-        add.set_halign(gtk4::Align::Start);
+        // Adding from the list: the review flow is also a place you notice you need
+        // another note. It used to be a second primary button directly under
+        // this heading *and* another in the footer; one is enough.
+        let head_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
+        let add = self.key_button("+  New note", Command::NewNote, "primary");
         add.connect_clicked({
             let ui = self.clone();
             move |_| ui.clone().dispatch(Action::NewNote)
         });
-        col.append(&add);
+        head_row.append(&add);
+        head_row.append(&count);
+        col.append(&head_row);
 
         // Same reason as the text view: rebuilding on every keystroke of the
         // search box destroyed the entry mid-search.
@@ -850,15 +941,22 @@ impl Ui {
             None => {
                 let e = gtk4::SearchEntry::new();
                 e.set_placeholder_text(Some("Search titles and content\u{2026}"));
+                e.add_css_class("search");
                 e.connect_search_changed({
                     let ui = self.clone();
                     move |ent| {
                         // Same hazard as the text view: set_text during a
-                        // rebuild re-enters this handler.
+                        // rebuild re-enters this handler, and the text it sets
+                        // is the query we already have. Setting it again would
+                        // start a search that never needed to happen.
                         if ui.app.try_borrow_mut().is_err() {
                             return;
                         }
-                        ui.clone().dispatch(Action::SetQuery(ent.text().to_string()));
+                        let text = ent.text().to_string();
+                        if ui.app.borrow().query == text {
+                            return;
+                        }
+                        ui.clone().dispatch(Action::SetQuery(text));
                     }
                 });
                 e
@@ -874,55 +972,73 @@ impl Ui {
         list.set_selection_mode(gtk4::SelectionMode::Single);
         list.set_vexpand(true);
         list.add_css_class("library");
-        for (i, row) in app.rows.iter().enumerate() {
+        // Without this a single click on a row selects it and nothing happens:
+        // there was no activation handler at all, so the list was a picture of
+        // your notes rather than a way into them.
+        list.set_activate_on_single_click(true);
+        for row in app.rows.iter() {
             let Some(doc) = app.index.get(&row.id) else { continue };
-            list.append(&self.clone().note_row(app, i, row, doc));
+            list.append(&self.clone().note_row(app, row, doc));
         }
-        let scroller = gtk4::ScrolledWindow::builder()
-            .child(&list)
-            .vexpand(true)
-            .hexpand(true)
-            .build();
-        scroller.add_css_class("note-surface");
-        col.append(&scroller);
+        list.connect_row_activated({
+            let ui = self.clone();
+            move |_, row| {
+                let i = ui.row_index(&row);
+                if let Some(id) = ui.app.borrow().rows.get(i).map(|r| r.id.clone()) {
+                    ui.clone().dispatch(Action::OpenNote(id));
+                }
+            }
+        });
+        list.connect_selected_rows_changed({
+            let ui = self.clone();
+            move |list| {
+                if *ui.syncing_selection.borrow() {
+                    return;
+                }
+                if let Some(row) = list.selected_row() {
+                    let i = ui.row_index(&row);
+                    if ui.app.borrow().selected != i {
+                        ui.clone().dispatch(Action::Select(i));
+                    }
+                }
+            }
+        });
+        // Show the stored selection. Clicking a row moves it, so writing it
+        // back has to be guarded or the two ends chase each other.
+        if let Some(row) = list.row_at_index(app.selected as i32) {
+            *self.syncing_selection.borrow_mut() = true;
+            list.select_row(Some(&row));
+            *self.syncing_selection.borrow_mut() = false;
+        }
 
         if app.rows.is_empty() {
-            let empty = gtk4::Label::new(Some(if app.query.is_empty() {
-                "No notes yet"
-            } else {
-                "Nothing matches — search is Unicode-aware, Hebrew works too"
-            }));
-            empty.add_css_class("subtitle");
-            col.append(&empty);
+            // The scroller used to be added regardless, so "nothing here yet"
+            // was printed underneath a full-height empty panel.
+            col.append(&self.empty_state(app));
+        } else {
+            let scroller = gtk4::ScrolledWindow::builder()
+                .child(&list)
+                .vexpand(true)
+                .hexpand(true)
+                .build();
+            scroller.add_css_class("note-surface");
+            col.append(&scroller);
         }
 
         let footer = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let new = gtk4::Button::with_label(&format!(
-            "+  New note  {}",
-            ui::pretty_key(&app.config.binding(Command::NewNote))
-        ));
-        new.add_css_class("primary");
-        new.connect_clicked({
-            let ui = self.clone();
-            move |_| ui.clone().dispatch(Action::NewNote)
-        });
-        footer.append(&new);
-
-        let up = gtk4::Button::with_label("\u{2191}");
-        up.add_css_class("ghost");
-        up.set_tooltip_text(Some(&ui::pretty_key(&app.config.binding(Command::MoveUp))));
+        let up = self.key_button("\u{2191}", Command::MoveUp, "ghost");
+        up.set_tooltip_text(Some("Move the selected note up"));
         up.connect_clicked({
             let ui = self.clone();
-            move |_| ui.clone().dispatch(Action::ReorderFocus(-1))
+            move |_| ui.clone().dispatch(Action::MoveSelected(-1))
         });
         footer.append(&up);
 
-        let down = gtk4::Button::with_label("\u{2193}");
-        down.add_css_class("ghost");
-        down.set_tooltip_text(Some(&ui::pretty_key(&app.config.binding(Command::MoveDown))));
+        let down = self.key_button("\u{2193}", Command::MoveDown, "ghost");
+        down.set_tooltip_text(Some("Move the selected note down"));
         down.connect_clicked({
             let ui = self.clone();
-            move |_| ui.clone().dispatch(Action::ReorderFocus(1))
+            move |_| ui.clone().dispatch(Action::MoveSelected(1))
         });
         footer.append(&down);
 
@@ -930,11 +1046,7 @@ impl Ui {
         spacer.set_hexpand(true);
         footer.append(&spacer);
 
-        let del = gtk4::Button::with_label(&format!(
-            "Delete  {}",
-            ui::pretty_key(&app.config.binding(Command::DeleteNote))
-        ));
-        del.add_css_class("ghost");
+        let del = self.key_button("Delete", Command::DeleteNote, "ghost");
         del.connect_clicked({
             let ui = self.clone();
             move |_| ui.clone().dispatch(Action::DeleteFocused)
@@ -945,27 +1057,95 @@ impl Ui {
         self.root.append(&col);
     }
 
-    fn note_row(self: Rc<Self>, app: &App, _i: usize, row: &Row, doc: &crate::search::Doc) -> gtk4::Widget {
+    /// Which note a list row stands for. Rows are rebuilt whenever anything
+    /// visible changes, so the index has to be read off the widget rather than
+    /// remembered.
+    fn row_index(&self, row: &gtk4::ListBoxRow) -> usize {
+        row.index() as usize
+    }
+
+    fn empty_state(self: &Rc<Self>, app: &App) -> gtk4::Box {
+        let b = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
+        b.add_css_class("empty-state");
+        b.set_vexpand(true);
+        b.set_valign(gtk4::Align::Center);
+        let (title, detail) = if app.query.is_empty() {
+            ("No notes yet", "Press A, or use New note, to write the first one.")
+        } else {
+            (
+                "Nothing matches",
+                "Search covers titles, file names and the whole body — in Hebrew too.",
+            )
+        };
+        let t = gtk4::Label::new(Some(title));
+        t.add_css_class("empty-title");
+        col_center(&t);
+        b.append(&t);
+        let d = gtk4::Label::new(Some(detail));
+        d.add_css_class("subtitle");
+        d.set_wrap(true);
+        d.set_justify(gtk4::Justification::Center);
+        col_center(&d);
+        b.append(&d);
+        b
+    }
+
+    fn note_row(self: Rc<Self>, app: &App, row: &Row, doc: &crate::search::Doc) -> gtk4::Widget {
         let r = gtk4::ListBoxRow::new();
+        // The class the stylesheet already described. Nothing ever added it, so
+        // rows rendered with no padding, no hover and no selection state.
+        r.add_css_class("note-row");
         let inner = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
 
+        // The note's own direction decides how its text is laid out. A Hebrew
+        // note left-aligned and bidi-reordered against the left margin reads
+        // like a bug; the list's own order, scrollbar and delete button stay
+        // put so the list still reads as one list.
+        let rtl = doc.direction == Direction::Rtl;
+        let align = if rtl { 1.0 } else { 0.0 };
         let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        // No direction, no badge. Telling the reader which language a note is
-        // in is not information they asked for, and rendering each row
-        // right-to-left on its own made the list look like two different
-        // lists stacked on top of each other. Direction is applied where it
-        // matters: in the editor, when the note is opened.
+        let text_col = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        text_col.set_hexpand(true);
+        set_direction(&text_col, doc.direction);
+
         let title = gtk4::Label::new(Some(doc.title.as_str()));
         title.add_css_class("note-title");
-        title.set_xalign(0.0);
+        title.set_xalign(align);
         title.set_hexpand(true);
         title.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        head.append(&title);
+        text_col.append(&title);
+
+        let preview = match row.at {
+            Some(at) if !app.query.is_empty() => app.index.snippet(&row.id, at, 28, 42),
+            _ => app
+                .index
+                .preview_body(&row.id, app.config.preview_lines)
+                .replace('\n', "  "),
+        };
+        let p = gtk4::Label::new(Some(&preview));
+        p.add_css_class("note-preview");
+        p.set_xalign(align);
+        p.set_wrap(true);
+        p.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        p.set_max_width_chars(90);
+        text_col.append(&p);
+
+        let meta = gtk4::Label::new(Some(&format!(
+            "{} \u{00b7} {} chars",
+            pretty_ago(&doc.path),
+            doc.content.len()
+        )));
+        meta.add_css_class("subtitle");
+        meta.set_xalign(align);
+        text_col.append(&meta);
+
+        head.append(&text_col);
 
         // Every row carries its own delete, rather than hiding it behind a
         // hover state that is easy to miss.
         let del = gtk4::Button::with_label("\u{2715}");
         del.add_css_class("flat");
+        del.add_css_class("row-delete");
         del.set_tooltip_text(Some("Delete this note"));
         del.set_valign(gtk4::Align::Start);
         del.connect_clicked({
@@ -976,30 +1156,6 @@ impl Ui {
         head.append(&del);
         inner.append(&head);
 
-        let preview = match row.at {
-            Some(at) if !app.query.is_empty() => app.index.snippet(&row.id, at, 28, 42),
-            _ => app
-                .index
-                .preview(&row.id, app.config.preview_lines)
-                .replace('\n', "  "),
-        };
-        let p = gtk4::Label::new(Some(&preview));
-        p.add_css_class("note-preview");
-        p.set_xalign(0.0);
-        p.set_wrap(true);
-        p.set_ellipsize(gtk4::pango::EllipsizeMode::End);
-        p.set_max_width_chars(90);
-        inner.append(&p);
-
-        let meta = gtk4::Label::new(Some(&format!(
-            "{} \u{00b7} {} chars",
-            pretty_ago(&doc.path),
-            doc.content.len()
-        )));
-        meta.add_css_class("subtitle");
-        meta.set_xalign(0.0);
-        inner.append(&meta);
-
         r.set_child(Some(&inner));
         r.upcast::<gtk4::Widget>()
     }
@@ -1007,60 +1163,130 @@ impl Ui {
     fn build_settings(self: &Rc<Self>, app: &App) {
         let page = self.page();
         page.set_spacing(4);
+
+        page.append(&self.chrome(app, "batnotes", true));
+
+        // One shape for the three tabs, so it is obvious they are three views
+        // of the same screen. The page below used to render General and
+        // nothing else: the Keys and Storage pages existed but were unreachable,
+        // which is where key remapping, the notes directory and the global
+        // hotkey status all lived.
+        let tabs = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        tabs.add_css_class("tabbar");
+        for tab in ui::Tab::ALL {
+            let active = app.settings_tab == tab;
+            let b = gtk4::Button::with_label(tab.label());
+            if active {
+                b.add_css_class("tab-active");
+            } else {
+                b.add_css_class("ghost");
+            }
+            b.connect_clicked({
+                let ui = self.clone();
+                move |_| ui.clone().dispatch(Action::SelectTab(tab))
+            });
+            tabs.append(&b);
+        }
+        page.append(&tabs);
+        page.append(&gtk4::Separator::new(gtk4::Orientation::Horizontal));
+
         let scroll = gtk4::ScrolledWindow::builder()
-            .child(&self.settings_page(app))
             .vexpand(true)
+            .hexpand(true)
             .build();
+        scroll.add_css_class("note-surface");
+        let page_body = match app.settings_tab {
+            ui::Tab::General => self.clone().settings_page(app),
+            ui::Tab::Keys => self.clone().keys_page(app),
+            ui::Tab::Storage => self.clone().storage_page(app),
+        };
+        scroll.set_child(Some(&page_body));
         page.append(&scroll);
         self.root.append(&page);
     }
 
     fn settings_page(self: &Rc<Self>, app: &App) -> gtk4::Box {
         let b = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+        b.add_css_class("settings");
+
+        // The desktop being dark must not decide what this window looks like:
+        // the app paints its own colours either way, so the choice is explicit.
+        b.append(&setting_row(
+            "Appearance",
+            "Light or dark, independent of your desktop theme",
+            segmented(
+                &["Light", "Dark"],
+                match app.config.theme {
+                    config::Theme::Light => 0,
+                    config::Theme::Dark => 1,
+                },
+                {
+                    let ui = self.clone();
+                    Rc::new(move |i| {
+                        let t = if i == 1 { config::Theme::Dark } else { config::Theme::Light };
+                        ui.clone().dispatch(Action::SetTheme(t));
+                    })
+                },
+            ),
+        ));
+
+        // F20 asked for this and it was only reachable from the keyboard.
+        b.append(&setting_row(
+            "Preview lines",
+            &format!("Each note shows {} lines in the list", app.config.preview_lines),
+            {
+                let ui = self.clone();
+                let box_ = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+                for delta in [-1i32, 1] {
+                    let b = gtk4::Button::with_label(if delta < 0 { "\u{2212}" } else { "+" });
+                    b.add_css_class("ghost");
+                    b.set_sensitive((app.config.preview_lines as i32 + delta).clamp(1, 8) != app.config.preview_lines as i32);
+                    let n = (app.config.preview_lines as i32 + delta).clamp(1, 8) as usize;
+                    let uic = ui.clone();
+                    b.connect_clicked(move |_| uic.clone().dispatch(Action::SetPreviewLines(n)));
+                    box_.append(&b);
+                }
+                let l = gtk4::Label::new(Some(&app.config.preview_lines.to_string()));
+                l.add_css_class("kbd");
+                l.set_valign(gtk4::Align::Center);
+                box_.append(&l);
+                box_.upcast::<gtk4::Widget>()
+            },
+        ));
+
         b.append(&setting_row(
             "Default direction",
             "Starting direction for new notes",
-            {
-                let ui = self.clone();
-                let stack = gtk4::Stack::new();
-                for (d, label) in [(Direction::Ltr, "LTR"), (Direction::Rtl, "RTL")] {
-                    let t = gtk4::ToggleButton::with_label(label);
-                    t.set_active(app.config.default_direction == d);
-                    if app.config.default_direction == d {
-                        t.add_css_class("on");
-                    }
-                    let uic = ui.clone();
-                    t.connect_clicked(move |_| uic.clone().dispatch(Action::SetDefaultDirection(d)));
-                    stack.add_named(&t, Some(label));
-                }
-                stack.set_visible_child_name(if app.config.default_direction == Direction::Rtl {
-                    "RTL"
-                } else {
-                    "LTR"
-                });
-                stack.upcast::<gtk4::Widget>()
-            },
+            segmented(
+                &["LTR", "RTL"],
+                if app.config.default_direction == Direction::Rtl { 1 } else { 0 },
+                {
+                    let ui = self.clone();
+                    Rc::new(move |i| {
+                        let d = if i == 1 { Direction::Rtl } else { Direction::Ltr };
+                        ui.clone().dispatch(Action::SetDefaultDirection(d));
+                    })
+                },
+            ),
         ));
 
         b.append(&setting_row(
             "When focus is lost",
             "Unsaved writing is never discarded silently",
-            {
-                let ui = self.clone();
-                let stack = gtk4::Stack::new();
-                for opt in [FocusLoss::AutoHide, FocusLoss::Prompt, FocusLoss::Never] {
-                    let t = gtk4::ToggleButton::with_label(opt.label());
-                    t.set_active(app.config.focus_loss == opt);
-                    if app.config.focus_loss == opt {
-                        t.add_css_class("on");
-                    }
-                    let uic = ui.clone();
-                    t.connect_clicked(move |_| uic.clone().dispatch(Action::SetFocusLoss(opt)));
-                    stack.add_named(&t, Some(opt.label()));
-                }
-                stack.set_visible_child_name(app.config.focus_loss.label());
-                stack.upcast::<gtk4::Widget>()
-            },
+            segmented(
+                &[FocusLoss::AutoHide.label(), FocusLoss::Prompt.label(), FocusLoss::Never.label()],
+                [FocusLoss::AutoHide, FocusLoss::Prompt, FocusLoss::Never]
+                    .iter()
+                    .position(|f| *f == app.config.focus_loss)
+                    .unwrap_or(0),
+                {
+                    let ui = self.clone();
+                    Rc::new(move |i| {
+                        let f = [FocusLoss::AutoHide, FocusLoss::Prompt, FocusLoss::Never][i];
+                        ui.clone().dispatch(Action::SetFocusLoss(f));
+                    })
+                },
+            ),
         ));
 
         b.append(&setting_row(
@@ -1120,15 +1346,30 @@ impl Ui {
         for cmd in config::ALL_COMMANDS.iter().copied() {
             let conflict = app.conflicts.contains(&cmd);
             let row = gtk4::ListBoxRow::new();
+            row.add_css_class("keys-row");
             let inner = gtk4::Box::new(gtk4::Orientation::Horizontal, 10);
 
             let l = gtk4::Label::new(Some(cmd.label()));
             l.set_xalign(0.0);
             l.set_hexpand(true);
+            l.set_wrap(true);
+            l.set_valign(gtk4::Align::Center);
             inner.append(&l);
+            let detail = gtk4::Label::new(Some(cmd.detail()));
+            detail.add_css_class("subtitle");
+            detail.set_xalign(0.0);
+            // Not expanding: the command name takes the slack so the keys stay
+            // aligned in a column instead of drifting into the middle.
+            detail.set_hexpand(false);
+            detail.set_wrap(true);
+            detail.set_valign(gtk4::Align::Center);
+            inner.append(&detail);
 
             let cap = if app.recording == Some(cmd) {
-                gtk4::Label::new(Some("press keys…"))
+                let l = gtk4::Label::new(Some("press keys…"));
+                l.add_css_class("kbd");
+                l.set_valign(gtk4::Align::Center);
+                l
             } else {
                 keycap(&app.config.binding(cmd))
             };
@@ -1139,6 +1380,7 @@ impl Ui {
 
             let rec = gtk4::Button::with_label("Record");
             rec.add_css_class("ghost");
+            rec.set_valign(gtk4::Align::Center);
             rec.connect_clicked({
                 let ui = self.clone();
                 move |_| {
@@ -1165,6 +1407,17 @@ impl Ui {
         b.append(&reset);
 
         let ok = app.hotkey.status.trigger_confirmed;
+        // Without a confirmed trigger the global key does nothing, and that
+        // used to be stated only here — on a tab that could not be opened.
+        if !ok {
+            let warn = gtk4::Label::new(Some(
+                "The global key is not active yet. Until it is, open batnotes from your app launcher.",
+            ));
+            warn.add_css_class("notice-text");
+            warn.set_wrap(true);
+            warn.set_xalign(0.0);
+            b.append(&warn);
+        }
         let detail = gtk4::Label::new(Some(&format!(
             "{} — {}",
             app.hotkey.status.backend.label(),
@@ -1320,8 +1573,15 @@ impl Ui {
     /// The visual language. Sizes are quiet and surfaces are flat, but every
     /// interactive edge is rounded and every state change is animated: that
     /// is the difference between a dialog and something that floats.
+    ///
+    /// Every widget the app uses is named here. That is not decoration: on a
+    /// dark desktop session GTK hands the app the dark variant of its theme,
+    /// and anything left unstyled comes back in the desktop's colours. The
+    /// notes list was unstyled, which is why it rendered near-black inside an
+    /// otherwise cream window.
     fn css(&self) -> String {
-        let p = &self.app.borrow().config.palette;
+        let theme = self.app.borrow().config.theme;
+        let p = self.app.borrow().config.palette().clone();
         let c = |s: &str| config::parse_colour(s).map(|c| c.css()).unwrap_or_default();
         let wash = |s: &str, a: f64| {
             config::parse_colour(s)
@@ -1335,25 +1595,68 @@ impl Ui {
                 })
                 .unwrap_or_default()
         };
+        // Ink on top of the accent. On the dark palette the accent is a pale
+        // green, so text on it has to be dark or it disappears.
+        let on_accent = if theme == config::Theme::Dark {
+            "#10140f"
+        } else {
+            "#ffffff"
+        };
         format!(
             r#"
-/* The window itself is the rounded card. Transparency lets the corners be
-   real; the compositor does the soft shadow. */
+/* --- the surface ---------------------------------------------------- */
 window {{ background: transparent; }}
 .root {{
   background: {paper};
   border: 1px solid {rule};
   border-radius: 16px;
   box-shadow: 0 18px 46px {shade}, 0 2px 8px {shade2};
+  color: {ink};
 }}
 
+/* --- everything the app draws is its own colour --------------------- */
+list, .library, list > row, listbox, listboxrow {{
+  background: transparent; color: {ink}; padding: 0; border: none;
+}}
+scrolledwindow {{ background: transparent; border: none; }}
+scrolledwindow > undershoot {{ background: transparent; }}
+scrolledwindow > scrollbar {{ background: transparent; }}
+separator {{ background: transparent; min-height: 1px; min-width: 1px; }}
+separator:hover {{ background: {rule}; }}
+
+entry, searchentry, textentry {{
+  background: {raised}; color: {ink};
+  border: 1px solid {rule}; border-radius: 10px;
+  padding: 9px 12px; caret-color: {accent};
+  transition: border-color 150ms ease;
+}}
+entry:focus, searchentry:focus, textentry:focus {{ border-color: {accent}; }}
+entry placeholder, searchentry placeholder, textentry placeholder {{ color: {faint}; }}
+
+/* The editor. The inner `text` node is what actually paints the writing
+   surface, so naming only the textview left the note area to the theme. */
+textview, textview > text, textview > border {{
+  background: transparent; background-color: transparent; color: {ink};
+}}
+textview:focus {{ background: transparent; }}
+.note, .writing {{ background: transparent; background-color: transparent; }}
+
+/* Scrollbars and the little controls keep to the palette too. */
+scrollbar slider {{ background: {rule}; border-radius: 4px; min-width: 8px; min-height: 8px; }}
+scrollbar slider:hover {{ background: {faint}; }}
+switch {{ background: {rule}; }}
+switch:checked {{ background: {accent}; }}
+switch slider {{ background: {raised}; }}
+
+/* --- type ----------------------------------------------------------- */
 .brand {{ font-weight: 700; font-size: 14px; color: {ink}; letter-spacing: -0.01em; }}
 .subtitle {{ color: {soft}; font-size: 12px; }}
 .mono {{ font-family: monospace; font-size: 11px; color: {soft}; }}
 .warn {{ color: {danger}; font-size: 11.5px; }}
 .ok {{ color: {accent}; font-size: 11.5px; }}
+.btn-text {{ font-size: 13px; }}
 
-/* --- chooser --- */
+/* --- chooser -------------------------------------------------------- */
 .overline {{
   font-size: 10.5px; font-weight: 750; color: {accent}; letter-spacing: 0.16em;
   margin-top: 6px;
@@ -1370,10 +1673,13 @@ window {{ background: transparent; }}
   transition: padding 180ms ease, background 180ms ease;
 }}
 .choice-row:hover {{ background: {wash}; padding-left: 14px; padding-right: 10px; }}
+/* A label stretches to the height of its box, which turned the icon into a
+   tall empty pill and the keycap into a tall empty pill beside it. */
 .choice-icon {{
-  font-size: 19px; color: {accent}; background: {wash};
-  min-width: 44px; min-height: 44px; border-radius: 12px;
+  background: {wash}; border-radius: 12px; min-width: 44px; min-height: 44px;
+  padding: 0; margin: 0;
 }}
+.choice-glyph {{ font-size: 18px; color: {accent}; }}
 .choice-title {{ font-size: 16px; font-weight: 650; color: {ink}; letter-spacing: -0.02em; }}
 .choice-count {{ color: {soft}; font-size: 12.5px; }}
 .choice-arrow {{ color: {faint}; font-size: 15px; transition: transform 180ms ease; }}
@@ -1390,6 +1696,7 @@ window {{ background: transparent; }}
 .resume-arrow {{ color: {soft}; font-size: 13px; }}
 .chooser-foot {{ color: {soft}; font-size: 11.5px; margin-top: 18px; }}
 
+/* --- keycaps --------------------------------------------------------- */
 .kbd {{
   font-family: monospace; font-size: 10.5px; padding: 4px 7px;
   border-radius: 5px; background: {wash}; color: {ink};
@@ -1397,55 +1704,112 @@ window {{ background: transparent; }}
 }}
 .kbd.conflict {{ border-color: {danger}; color: {danger}; }}
 
-/* --- editor --- */
-.note {{ background: transparent; color: {ink}; font-size: 15px; caret-color: {accent}; }}
+/* --- editor --------------------------------------------------------- */
+.note {{ font-size: 15px; caret-color: {accent}; }}
 .writing {{
-  background: transparent;
-  background-image: repeating-linear-gradient(to bottom, transparent 0, transparent 35px, {rule} 35px, {rule} 36px);
-  border: 1px solid {rule}; border-radius: 10px; transition: border-color 160ms ease;
+  border: 1px solid {rule}; border-radius: 10px;
+  transition: border-color 160ms ease;
 }}
 .writing:focus {{ border-color: {accent}; }}
 .section-title {{ font-family: {serif}; font-weight: 400; font-size: 26px; color: {ink}; letter-spacing: -0.02em; }}
 
-/* --- library --- */
+/* --- library -------------------------------------------------------- */
+.note-surface {{ background: transparent; }}
 .note-row {{
-  padding: 13px 10px; border-radius: 10px; border-bottom: 1px solid {rule};
+  padding: 11px 10px; border-radius: 10px; border-bottom: 1px solid {rule};
   transition: background 150ms ease, padding 150ms ease;
 }}
 .note-row:hover {{ background: {wash}; padding-left: 14px; }}
-.note-row.selected {{ background: {wash}; border-left: 2px solid {accent}; }}
+.note-row.selected {{ background: {wash}; border-left: 2px solid {accent}; padding-left: 12px; }}
 .note-title {{ font-weight: 650; font-size: 14px; color: {ink}; }}
 .note-preview {{ color: {soft}; font-size: 12.5px; }}
+.row-delete {{ opacity: 0.55; }}
+.note-row:hover .row-delete {{ opacity: 1; }}
+
+.empty-state {{
+  background: {wash}; border: 1px dashed {rule}; border-radius: 12px;
+  padding: 26px 20px;
+}}
+.empty-title {{ font-family: {serif}; font-size: 19px; color: {ink}; }}
+
 .badge-rtl, .badge-ltr {{ font-size: 9.5px; font-weight: 700; padding: 2px 7px; border-radius: 6px; }}
 .badge-rtl {{ background: {claywash}; color: {clay}; }}
 .badge-ltr {{ background: {wash}; color: {soft}; }}
 
-.hintbar {{ margin-top: 10px; padding-top: 9px; border-top: 1px solid {rule}; }}
+/* --- settings ------------------------------------------------------- */
+.settings {{ padding-top: 4px; }}
+.setting-row {{
+  padding-bottom: 13px; margin-bottom: 13px;
+  border-bottom: 1px solid {rule};
+}}
+.setting-row > label, .setting-row > box {{ min-width: 0; }}
+.setting-row:last-child {{ border-bottom: none; }}
+.tabbar {{ margin-bottom: 2px; }}
+.tabbar > button {{ min-width: 96px; }}
+.tab-active {{
+  background: {wash}; color: {ink}; border: 1px solid {accent};
+  border-radius: 8px; padding: 8px 14px; font-weight: 620;
+}}
+.segmented {{ background: transparent; }}
+.segment {{
+  background: {wash}; color: {soft}; border: 1px solid {rule};
+  border-radius: 8px; padding: 7px 11px; font-size: 12.5px;
+  transition: background 150ms ease, color 150ms ease;
+}}
+.segment:hover {{ border-color: {accent}; color: {ink}; }}
+.segment.on {{ background: {accent}; color: {on_accent}; border-color: {accent}; font-weight: 620; }}
+.keys {{ background: transparent; }}
+.keys-row {{
+  padding: 9px 6px; border-bottom: 1px solid {rule};
+  transition: background 150ms ease;
+}}
+.keys-row:hover {{ background: {wash}; }}
+
+/* --- shared furniture ------------------------------------------------ */
+.hintbar {{
+  margin-top: 10px; padding: 9px 6px 0; border-top: 1px solid {rule};
+}}
+.hintbar-empty {{ margin-top: 0; padding-top: 0; border-top: none; }}
 .hintlabel {{ color: {soft}; font-size: 11px; }}
 
-.banner {{ padding: 10px 12px; border-radius: 9px; background: {wash}; }}
-.banner-warn {{ background: {claywash}; }}
-.banner-danger {{ background: {dangerwash}; }}
+.notice {{
+  margin: 10px 6px 0; padding: 9px 11px; border-radius: 9px;
+  border: 1px solid {rule};
+}}
+.notice-text {{ font-size: 12px; color: {ink}; }}
+.banner {{ background: {wash}; }}
+.banner-warn {{ background: {claywash}; border-color: {clay}; }}
+.banner-danger {{ background: {dangerwash}; border-color: {danger}; }}
+
 .primary {{
-  background: {accent}; color: #ffffff; border: none; border-radius: 8px;
-  padding: 9px 15px; font-weight: 620; transition: background 150ms ease, transform 150ms ease;
+  background: {accent}; color: {on_accent}; border: none; border-radius: 8px;
+  padding: 9px 15px; font-weight: 620;
+  transition: background 150ms ease, transform 150ms ease;
 }}
 .primary:hover {{ background: {accentdeep}; }}
 .primary:active {{ transform: translateY(1px); }}
 .ghost, .flat {{
   background: transparent; border: 1px solid {rule}; color: {ink};
-  border-radius: 8px; padding: 8px 12px; transition: background 150ms ease, border-color 150ms ease;
+  border-radius: 8px; padding: 8px 12px;
+  transition: background 150ms ease, border-color 150ms ease;
 }}
-.flat {{ border: none; }}
-.ghost:hover, .flat:hover {{ background: {wash}; border-color: {accent}; }}
-.danger {{ background: {danger}; color: #ffffff; border: none; border-radius: 8px; padding: 9px 15px; font-weight: 620; }}
+.flat {{ border: none; background: transparent; color: {soft}; padding: 6px 9px; }}
+.ghost:hover, .flat:hover {{ background: {wash}; border-color: {accent}; color: {ink}; }}
+.ghost:disabled, .flat:disabled {{ opacity: 0.4; }}
+.danger {{
+  background: {danger}; color: #ffffff; border: none; border-radius: 8px;
+  padding: 9px 15px; font-weight: 620;
+}}
 .danger:hover {{ background: {dangerdeep}; }}
+
+/* A toast is a message, not a bar: it was full width with square corners at
+   the very bottom, where it read as part of the window frame. */
 .toast {{
-  background: {accent}; color: #ffffff; border-radius: 16px;
-  padding: 9px 16px; font-size: 12px; margin-top: 10px;
+  background: {accent}; color: {on_accent}; border-radius: 999px;
+  padding: 7px 15px; font-size: 12px; margin: 10px 6px 2px;
 }}
 .conflict {{ background: {dangerwash}; }}
-.on {{ background: {accent}; color: #ffffff; }}
+.on {{ background: {accent}; color: {on_accent}; }}
 
 .scrim {{ background: {scrim}; border-radius: 16px; }}
 .confirm-panel {{
@@ -1468,9 +1832,10 @@ window {{ background: transparent; }}
             claywash = wash(&p.clay, 0.14),
             dangerdeep = c(&p.danger_deep),
             dangerwash = wash(&p.danger, 0.11),
-            scrim = wash("#1a2a1d", 0.30),
-            shade = wash("#1a2a1d", 0.16),
-            shade2 = wash("#1a2a1d", 0.07),
+            on_accent = on_accent.to_string(),
+            scrim = wash("#0d120f", 0.42),
+            shade = wash("#0d120f", 0.22),
+            shade2 = wash("#0d120f", 0.10),
             serif = "Georgia, 'DejaVu Serif', 'Noto Serif', serif".to_string(),
         )
     }
@@ -1478,22 +1843,61 @@ window {{ background: transparent; }}
 
 // ---- helpers ---------------------------------------------------------------
 
+/// Centred label, left as a helper because every call site spelled out the same
+/// three lines.
+fn col_center(l: &gtk4::Label) {
+    l.set_xalign(0.5);
+    l.set_hexpand(true);
+}
+
+/// A row of options where the current one is visible alongside the others.
+///
+/// The previous control was a `Stack` holding only the selected child, so the
+/// only option on screen was the one already in effect — you could change the
+/// value but never see what the alternatives were.
+fn segmented(labels: &[&str], current: usize, pick: Rc<dyn Fn(usize)>) -> gtk4::Widget {
+    let wrap = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
+    wrap.add_css_class("segmented");
+    for (i, l) in labels.iter().enumerate() {
+        let t = gtk4::ToggleButton::with_label(l);
+        t.add_css_class("segment");
+        if i == current {
+            t.set_active(true);
+            t.add_css_class("on");
+        }
+        let p = pick.clone();
+        t.connect_clicked(move |_| p(i));
+        wrap.append(&t);
+    }
+    wrap.upcast::<gtk4::Widget>()
+}
+
 fn keycap(binding: &str) -> gtk4::Label {
     let l = gtk4::Label::new(Some(&ui::pretty_key(binding)));
     l.add_css_class("kbd");
+    // A label otherwise stretches to the full height of the box it is in, so
+    // every keycap grew into a tall empty pill.
+    l.set_valign(gtk4::Align::Center);
     l
 }
 
 fn setting_row(title: &str, sub: &str, control: gtk4::Widget) -> gtk4::Box {
     let b = gtk4::Box::new(gtk4::Orientation::Horizontal, 12);
-    let text = gtk4::Box::new(gtk4::Orientation::Vertical, 1);
+    // Without this the rows ran together into a wall of text and the controls
+    // on the right were pushed off the edge of the window.
+    b.add_css_class("setting-row");
+    let text = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
     let t = gtk4::Label::new(Some(title));
     t.add_css_class("choice-title");
     t.set_xalign(0.0);
+    t.set_hexpand(true);
+    t.set_wrap(true);
     text.append(&t);
     let s = gtk4::Label::new(Some(sub));
     s.add_css_class("subtitle");
     s.set_xalign(0.0);
+    s.set_hexpand(true);
+    s.set_wrap(true);
     text.append(&s);
     text.set_hexpand(true);
     b.append(&text);
@@ -1590,7 +1994,9 @@ fn action_for(ui: &Ui, combo: &str) -> Option<Action> {
         Command::Save => Action::Save { close: false },
         Command::SaveClose => Action::Save { close: true },
         Command::Back => Action::Back,
-        Command::FocusSearch => Action::SetQuery(app.query.clone()),
+        // Used to map to `SetQuery(app.query.clone())`, which sets the query to
+        // the value it already has. The binding did nothing at all.
+        Command::FocusSearch => Action::FocusSearch,
         Command::ToggleDirection => Action::SetDirection(app.ed_dir.other()),
         Command::TogglePreviewLines => {
             Action::SetPreviewLines(if app.config.preview_lines >= 8 {
@@ -1602,8 +2008,11 @@ fn action_for(ui: &Ui, combo: &str) -> Option<Action> {
         Command::DeleteNote if has_selection => {
             Action::ConfirmDelete(app.rows.get(app.selected)?.id.clone())
         }
-        Command::MoveUp if has_selection => Action::ReorderFocus(-1),
-        Command::MoveDown if has_selection => Action::ReorderFocus(1),
+        // Reorder the note under the selection. This only moved the selection
+        // index before, so the arrows and their bindings did nothing to the
+        // order they claim to change.
+        Command::MoveUp if has_selection => Action::MoveSelected(-1),
+        Command::MoveDown if has_selection => Action::MoveSelected(1),
         _ => return None,
     })
 }

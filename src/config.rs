@@ -148,6 +148,32 @@ impl Default for FocusLoss {
     }
 }
 
+/// Light or dark. Not the desktop's setting: batnotes picks its own so the
+/// window is the same on a dark KDE session as on a light one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Theme {
+    Light,
+    Dark,
+}
+
+impl Theme {
+    pub const ALL: [Theme; 2] = [Theme::Light, Theme::Dark];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Theme::Light => "Light",
+            Theme::Dark => "Dark",
+        }
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme::Light
+    }
+}
+
 /// A named colour, so the palette is data rather than code and the user can
 /// retint the whole app without a rebuild.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -189,6 +215,28 @@ impl Default for Palette {
     }
 }
 
+impl Palette {
+    /// The same palette read on a dark surface. Green ink on near-black keeps
+    /// the accent that carries the app; the greys are lifted so secondary text
+    /// still clears 4.5:1.
+    pub fn dark() -> Palette {
+        Palette {
+            paper: "#1c201d".into(),
+            paper_raised: "#252a26".into(),
+            ink: "#e6ece4".into(),
+            ink_soft: "#a3ada2".into(),
+            ink_faint: "#8b958a".into(),
+            accent: "#7fc79b".into(),
+            accent_deep: "#9ad9b1".into(),
+            clay: "#d9a469".into(),
+            rule: "#333a34".into(),
+            wash: "#2b312c".into(),
+            danger: "#e08878".into(),
+            danger_deep: "#f0a396".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -211,7 +259,9 @@ pub struct Config {
     pub restore_position: bool,
     pub ui_font: Option<PathBuf>,
     pub heading_font: Option<PathBuf>,
+    pub theme: Theme,
     pub palette: Palette,
+    pub dark_palette: Palette,
     #[serde(default)]
     pub bindings: Bindings,
 }
@@ -231,7 +281,9 @@ impl Default for Config {
             restore_position: true,
             ui_font: None,
             heading_font: None,
+            theme: Theme::Light,
             palette: Palette::default(),
+            dark_palette: Palette::dark(),
             bindings: default_bindings(),
         }
     }
@@ -350,6 +402,15 @@ impl Config {
             .get(&c)
             .cloned()
             .unwrap_or_else(|| "—".to_string())
+    }
+
+    /// The palette the UI should draw with. Every colour the app renders comes
+    /// from here — nothing is inherited from the desktop theme.
+    pub fn palette(&self) -> &Palette {
+        match self.theme {
+            Theme::Dark => &self.dark_palette,
+            Theme::Light => &self.palette,
+        }
     }
 }
 
