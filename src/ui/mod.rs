@@ -43,6 +43,7 @@ pub enum Action {
     SetDirection(crate::model::Direction),
     SetDefaultDirection(crate::model::Direction),
     SetKeepAbove(bool),
+    DeleteFocused,
     SetPreviewLines(usize),
     SetFocusLoss(crate::config::FocusLoss),
     SetFsync(bool),

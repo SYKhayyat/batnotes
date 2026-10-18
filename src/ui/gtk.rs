@@ -188,20 +188,22 @@ impl Ui {
     }
 
     /// Cheap fingerprint of everything the tree depends on.
+    /// What the tree is built from.
+    ///
+    /// Deliberately excludes the note text. The editor is a live widget now,
+    /// so a keystroke changes nothing structural — but counting characters
+    /// here meant every single keystroke rebuilt the entire tree, which is
+    /// exactly what made the window blink while typing.
     fn signature(&self) -> String {
         let a = self.app.borrow();
         format!(
-            "{:?}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{}|{:?}",
+            "{:?}|{:?}|{:?}|{}|{:?}|{:?}|{:?}",
             a.view,
-            a.ed_id.clone().unwrap_or_default(),
-            a.ed_text.len(),
+            a.ed_id,
             a.ed_dir == Direction::Rtl,
-            a.dirty(),
-            a.query,
             a.rows.len(),
             a.prompt,
             a.confirm_delete,
-            a.conflicts.len(),
             a.recording,
         )
     }
@@ -478,6 +480,54 @@ impl Ui {
         }
     }
 
+    /// The chrome every view shares: where you are, how to get back, how to
+    /// leave, and the key for each.
+    ///
+    /// One shape for all of them. A control that appears in one view and not
+    /// another is a control you have to go looking for.
+    fn chrome(self: &Rc<Self>, app: &App, title: &str, show_back: bool) -> gtk4::Box {
+        let bar = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let key = |c: Command| ui::pretty_key(&app.config.binding(c));
+
+        if show_back {
+            let back = gtk4::Button::with_label(&format!("\u{2190}  Back  {}", key(Command::Back)));
+            back.add_css_class("ghost");
+            back.set_tooltip_text(Some("Return to the previous view"));
+            back.connect_clicked({
+                let ui = self.clone();
+                move |_| ui.clone().dispatch(Action::Back)
+            });
+            bar.append(&back);
+        }
+
+        let name = gtk4::Label::new(Some(title));
+        name.add_css_class("brand");
+        name.set_xalign(0.0);
+        name.set_hexpand(true);
+        name.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
+        bar.append(&name);
+
+        let settings = gtk4::Button::with_label(&format!("\u{2699}  {}", key(Command::Settings)));
+        settings.add_css_class("ghost");
+        settings.set_tooltip_text(Some("Settings"));
+        settings.connect_clicked({
+            let ui = self.clone();
+            move |_| ui.clone().dispatch(Action::OpenSettings)
+        });
+        bar.append(&settings);
+
+        let close = gtk4::Button::with_label("\u{2715}");
+        close.add_css_class("flat");
+        close.set_tooltip_text(Some(&format!("Close ({})", key(Command::Invoke))));
+        close.connect_clicked({
+            let ui = self.clone();
+            move |_| ui.clone().dispatch(Action::Close)
+        });
+        bar.append(&close);
+
+        bar
+    }
+
     /// A padded content column. The card keeps the rounded corners; the
     /// content stays clear of them.
     fn page(&self) -> gtk4::Box {
@@ -630,7 +680,7 @@ impl Ui {
     fn build_editor(self: &Rc<Self>, app: &App) {
         let col = self.page();
 
-        let head = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+        let head = self.chrome(app, "batnotes", true);
         // The title, not the filename. The id is opaque and meaningless to a
         // person; in the list it read as noise.
         let label: String = match &app.ed_id {
@@ -641,13 +691,15 @@ impl Ui {
                 .unwrap_or_else(|| "Note".to_string()),
             None => "New note".to_string(),
         };
+        col.append(&head);
+
         let name = gtk4::Label::new(Some(&label));
         name.add_css_class("section-title");
         name.set_xalign(0.0);
         name.set_hexpand(true);
         name.set_ellipsize(gtk4::pango::EllipsizeMode::Middle);
         set_direction(&name, app.ed_dir);
-        head.append(&name);
+        col.append(&name);
 
         // Deliberately no "saving… / saved" label. The note saves itself; a
         // status light is one more thing to look at while trying to think.
@@ -720,28 +772,28 @@ impl Ui {
         *self.editor_count.borrow_mut() = Some(count.clone());
         foot.append(&count);
 
-        // Keyboard alone is not an interface. Capture needs a visible way to
-        // reach the list and a visible way out.
-        let notes = gtk4::Button::with_label("\u{25a6}  My notes");
+        // Every action reachable by button as well as by key.
+        let notes = gtk4::Button::with_label(&format!(
+            "\u{25a6}  My notes  {}",
+            ui::pretty_key(&app.config.binding(Command::ShowLibrary))
+        ));
         notes.add_css_class("ghost");
-        notes.set_tooltip_text(Some(&ui::pretty_key(&app.config.binding(Command::ShowLibrary))));
         notes.connect_clicked({
             let ui = self.clone();
             move |_| ui.clone().dispatch(Action::ShowLibrary)
         });
         foot.append(&notes);
 
-        let close = gtk4::Button::with_label("\u{2715}");
-        close.add_css_class("flat");
-        close.set_tooltip_text(Some(&format!(
-            "Close ({})",
-            ui::pretty_key(&app.config.binding(Command::Back))
-        )));
-        close.connect_clicked({
+        let save = gtk4::Button::with_label(&format!(
+            "Save  {}",
+            ui::pretty_key(&app.config.binding(Command::SaveClose))
+        ));
+        save.add_css_class("primary");
+        save.connect_clicked({
             let ui = self.clone();
-            move |_| ui.clone().dispatch(Action::Close)
+            move |_| ui.clone().dispatch(Action::Save { close: true })
         });
-        foot.append(&close);
+        foot.append(&save);
         col.append(&foot);
 
         self.root.append(&col);
@@ -763,6 +815,8 @@ impl Ui {
     fn build_library(self: &Rc<Self>, app: &App) {
         let col = self.page();
         col.set_spacing(8);
+
+        col.append(&self.chrome(app, "batnotes", true));
 
         let h = gtk4::Label::new(Some("My notes"));
         h.add_css_class("display");
@@ -843,7 +897,10 @@ impl Ui {
         }
 
         let footer = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
-        let new = gtk4::Button::with_label("+  New note");
+        let new = gtk4::Button::with_label(&format!(
+            "+  New note  {}",
+            ui::pretty_key(&app.config.binding(Command::NewNote))
+        ));
         new.add_css_class("primary");
         new.connect_clicked({
             let ui = self.clone();
@@ -851,40 +908,38 @@ impl Ui {
         });
         footer.append(&new);
 
-        let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        footer.append(&spacer);
-
-        let back = gtk4::Button::with_label("Back");
-        back.add_css_class("ghost");
-        back.connect_clicked({
-            let ui = self.clone();
-            move |_| ui.clone().dispatch(Action::Back)
-        });
-        footer.append(&back);
-
-        let close = gtk4::Button::with_label("\u{2715}");
-        close.add_css_class("flat");
-        close.connect_clicked({
-            let ui = self.clone();
-            move |_| ui.clone().dispatch(Action::Close)
-        });
-        footer.append(&close);
-
-        let up = gtk4::Button::with_label("↑ move");
+        let up = gtk4::Button::with_label("\u{2191}");
         up.add_css_class("ghost");
+        up.set_tooltip_text(Some(&ui::pretty_key(&app.config.binding(Command::MoveUp))));
         up.connect_clicked({
             let ui = self.clone();
             move |_| ui.clone().dispatch(Action::ReorderFocus(-1))
         });
         footer.append(&up);
-        let down = gtk4::Button::with_label("↓ move");
+
+        let down = gtk4::Button::with_label("\u{2193}");
         down.add_css_class("ghost");
+        down.set_tooltip_text(Some(&ui::pretty_key(&app.config.binding(Command::MoveDown))));
         down.connect_clicked({
             let ui = self.clone();
             move |_| ui.clone().dispatch(Action::ReorderFocus(1))
         });
         footer.append(&down);
+
+        let spacer = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+        spacer.set_hexpand(true);
+        footer.append(&spacer);
+
+        let del = gtk4::Button::with_label(&format!(
+            "Delete  {}",
+            ui::pretty_key(&app.config.binding(Command::DeleteNote))
+        ));
+        del.add_css_class("ghost");
+        del.connect_clicked({
+            let ui = self.clone();
+            move |_| ui.clone().dispatch(Action::DeleteFocused)
+        });
+        footer.append(&del);
         col.append(&footer);
 
         self.root.append(&col);

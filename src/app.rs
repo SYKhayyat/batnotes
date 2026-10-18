@@ -517,14 +517,20 @@ impl App {
             Action::Back => match self.view {
                 View::Settings => self.view = self.prev_view,
                 View::Library => self.view = View::Chooser,
+                // Back means "one step up", not "shut the app". Closing is
+                // what Back does at the top of the stack, and what the invoke
+                // key does anywhere.
                 View::Editor => {
-                    if self.dirty() {
-                        self.prompt = Some(ui::PROMPT_CANCEL.into());
-                    } else {
-                        self.hide();
-                    }
+                    // Persist, but stay open: we are stepping up a level,
+                    // not shutting down.
+                    self.save_quiet(false);
+                    self.view = self.ed_return;
+                    self.ed_id = None;
+                    self.ed_text.clear();
+                    self.ed_original.clear();
+                    self.prompt = None;
                 }
-                _ => self.hide(),
+                View::Chooser => self.hide(),
             },
             Action::Save { close } => self.save(close),
             Action::Cancel => {
@@ -650,6 +656,11 @@ impl App {
                 let _ = self.config.save(&self.config_path);
                 if v {
                     crate::platform::apply_keep_above("batnotes");
+                }
+            }
+            Action::DeleteFocused => {
+                if let Some(id) = self.rows.get(self.selected).map(|r| r.id.clone()) {
+                    self.confirm_delete = Some(id);
                 }
             }
             Action::Close => self.hide(),
@@ -822,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn back_closes_the_overlay_rather_than_navigating_a_menu() {
+    fn back_walks_up_one_level_and_saves_on_the_way() {
         let d = tempfile::tempdir().unwrap();
         let mut a = test_app(d.path());
         a.show();
@@ -836,7 +847,12 @@ mod tests {
         assert_eq!(a.view, View::Editor, "picking a note opens the editor");
         a.visible = true;
         a.dispatch(Action::Back);
-        assert!(!a.visible, "Back means 'I am done here'");
+        assert_eq!(a.view, View::Library, "Back returns to the list you came from");
+        assert!(a.visible, "going back must not close the overlay");
+        a.dispatch(Action::Back);
+        assert_eq!(a.view, View::Chooser);
+        a.dispatch(Action::Back);
+        assert!(!a.visible, "Back at the top of the stack closes");
     }
 
     #[test]
